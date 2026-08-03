@@ -472,11 +472,9 @@ class ArchiveReader {
         head.entry = _parseFileHeader50(
           raw,
           head,
+          extraSize: extraSize,
           isService: head.type == HeaderType.headService,
         );
-        if (extraSize != 0) {
-          raw.skip(extraSize);
-        }
         break;
       case HeaderType.headEndArc:
       default:
@@ -505,6 +503,7 @@ class ArchiveReader {
   ArchiveEntry? _parseFileHeader50(
     RawReader raw,
     _BlockHeader head, {
+    required int extraSize,
     required bool isService,
   }) {
     final fileFlags = raw.getV();
@@ -555,12 +554,14 @@ class ArchiveReader {
           0x20000 << ((compInfo >> 10) & (unpVer == verPack5 ? 0x0f : 0x1f));
     }
 
+    final isEncrypted = extraSize != 0 && _processExtra50(raw, extraSize);
+
     return ArchiveEntry(
       name: name,
       packSize: head.dataSize,
       unpSize: unpSize,
       isDirectory: isDir,
-      isEncrypted: false,
+      isEncrypted: isEncrypted,
       isSolid: (compInfo & fciSolid) != 0,
       splitBefore: (head.flags & hflSplitBefore) != 0,
       splitAfter: (head.flags & hflSplitAfter) != 0,
@@ -580,6 +581,33 @@ class ArchiveReader {
               ? HostSystemType.hsysWindows
               : HostSystemType.hsysUnknown,
     );
+  }
+
+  /// Parses the RAR 5.0 header extra area, mirroring `ProcessExtra50`, and
+  /// returns whether a file encryption (`FHEXTRA_CRYPT`) record was present.
+  bool _processExtra50(RawReader raw, int extraSize) {
+    final extraStart = raw.size - extraSize;
+    if (extraStart < raw.readPos) {
+      return false;
+    }
+    raw.setPos(extraStart);
+    var isEncrypted = false;
+    while (raw.dataLeft >= 2) {
+      final fieldSize = raw.getV();
+      if (fieldSize <= 0 || raw.dataLeft == 0 || fieldSize > raw.dataLeft) {
+        break;
+      }
+      final nextPos = raw.readPos + fieldSize;
+      final fieldType = raw.getV();
+      if (nextPos - raw.readPos < 0) {
+        break; // Field type is longer than the declared field size.
+      }
+      if (fieldType == fhExtraCrypt) {
+        isEncrypted = true;
+      }
+      raw.setPos(nextPos);
+    }
+    return isEncrypted;
   }
 
   // ---------------------------------------------------------------------

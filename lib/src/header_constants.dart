@@ -82,6 +82,15 @@ const int ehflNextVolume = 0x0001;
 // RAR 5.0 encryption header flags.
 const int chflCryptPswCheck = 0x0001;
 
+// RAR 5.0 header extra area record types.
+const int fhExtraCrypt = 0x01; // Encryption parameters.
+const int fhExtraHash = 0x02; // File hash.
+const int fhExtraHtime = 0x03; // High precision file time.
+const int fhExtraVersion = 0x04; // File version information.
+const int fhExtraRedir = 0x05; // File system redirection.
+const int fhExtraUowner = 0x06; // Unix owner and group information.
+const int fhExtraSubdata = 0x07; // Service header subdata array.
+
 // RAR 5.0 file compression info flags.
 const int fciSolid = 0x00000040;
 const int fciRar5Compat = 0x00100000;
