@@ -5,7 +5,7 @@ import 'package:neoasis_unrar/io.dart';
 /// Lists the contents of a RAR archive.
 ///
 /// Usage:
-///   dart run example/bin/list_archive.dart [archive.rar]
+///   dart run example/bin/list_archive.dart `archive.rar`
 Future<void> main(List<String> args) async {
   if (args.isEmpty) {
     stderr.writeln('Usage: dart run example/bin/list_archive.dart <archive.rar>');

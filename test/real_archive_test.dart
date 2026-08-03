@@ -73,6 +73,116 @@ void main() {
     });
   });
 
+  group('real extraction (stored archives)', () {
+    // Fully stored (method 0) archives whose unpacked bytes must exactly
+    // match the source files they were created from.
+    const storedCases = <String, List<String>>{
+      'test_data/basic_rar4.rar': ['hello.txt', 'world.txt'],
+      'test_data/binary.rar': ['binary.bin'],
+      'test_data/rar4_binary.rar': ['binary.bin'],
+      'test_data/rar4_solid.rar': ['hello.txt', 'world.txt', 'nested.txt'],
+      'test_data/rar4_with_dirs.rar': ['hello.txt', 'world.txt', 'nested.txt'],
+      'test_data/unicode_names.rar': ['café.txt'],
+    };
+
+    storedCases.forEach((path, expectedNames) {
+      test('${path.split('/').last} extracts byte-exact files', () async {
+        final archive = await openRarFile(_path(path));
+        addTearDown(archive.close);
+
+        final extracted = <String, List<int>>{};
+        await archive.extractAll((entry, data) {
+          extracted[entry.name.split('/').last] = data;
+        });
+
+        expect(extracted.keys.toSet(), expectedNames.toSet());
+        for (final name in expectedNames) {
+          final ref = File(_sourceFor(name)).readAsBytesSync();
+          expect(extracted[name], ref, reason: '$name does not match source');
+        }
+      });
+    });
+
+    test('extractFile returns byte-exact data and works after list()',
+        () async {
+      final archive = await openRarFile(_path('test_data/basic_rar4.rar'));
+      addTearDown(archive.close);
+
+      await archive.list();
+      final hello = await archive.extractFile('hello.txt');
+      expect(hello, File(_sourceFor('hello.txt')).readAsBytesSync());
+
+      final missing = await archive.extractFile('nope.txt');
+      expect(missing, isNull);
+    });
+
+    test('extractFile seeks straight to the data in solid archives', () async {
+      final archive = await openRarFile(_path('test_data/rar4_solid.rar'));
+      addTearDown(archive.close);
+      final nested = await archive.extractFile('subdir/nested.txt');
+      expect(nested, File(_sourceFor('nested.txt')).readAsBytesSync());
+    });
+
+    test('testArchive passes for fully stored archives', () async {
+      final archive = await openRarFile(_path('test_data/basic_rar4.rar'));
+      addTearDown(archive.close);
+      expect(await archive.testArchive(), isTrue);
+    });
+
+    test('encrypted file data throws an UnrarException', () async {
+      final archive = await openRarFile(_path('test_data/encrypted_data.rar'));
+      addTearDown(archive.close);
+      final entries = await archive.list();
+      expect(entries.first.isEncrypted, isTrue);
+      await expectLater(
+        archive.extractFile(entries.first.name),
+        throwsA(isA<UnrarException>()),
+      );
+    });
+  });
+
+  group('real extraction (RAR 5 compressed)', () {
+    // RAR 5.0 method 3 (deflate-style LZ) archives whose unpacked bytes must
+    // exactly match the source files. solid.rar additionally exercises window
+    // state carry-over across the files of a solid stream.
+    const compressedCases = <String, List<String>>{
+      'test_data/basic_rar5.rar': ['hello.txt', 'world.txt'],
+      'test_data/with_dirs.rar': ['hello.txt', 'world.txt', 'nested.txt'],
+      'test_data/solid.rar': ['hello.txt', 'nested.txt', 'world.txt'],
+    };
+
+    compressedCases.forEach((path, expectedNames) {
+      test('${path.split('/').last} extracts byte-exact RAR5 files', () async {
+        final archive = await openRarFile(_path(path));
+        addTearDown(archive.close);
+
+        final extracted = <String, List<int>>{};
+        await archive.extractAll((entry, data) {
+          extracted[entry.name.split('/').last] = data;
+        });
+
+        expect(extracted.keys.toSet(), expectedNames.toSet());
+        for (final name in expectedNames) {
+          final ref = File(_sourceFor(name)).readAsBytesSync();
+          expect(extracted[name], ref, reason: '$name does not match source');
+        }
+      });
+    });
+
+    test('extractFile unpacks the solid stream before a later file', () async {
+      final archive = await openRarFile(_path('test_data/solid.rar'));
+      addTearDown(archive.close);
+      final world = await archive.extractFile('world.txt');
+      expect(world, File(_sourceFor('world.txt')).readAsBytesSync());
+    });
+
+    test('testArchive passes for compressed RAR5 archives', () async {
+      final archive = await openRarFile(_path('test_data/basic_rar5.rar'));
+      addTearDown(archive.close);
+      expect(await archive.testArchive(), isTrue);
+    });
+  });
+
   group('real volume fixtures (rar 7.x output)', () {
     const cases = <String, Map<String, Object>>{
       'vol.part1.rar': {
@@ -143,6 +253,16 @@ class _Case {
 }
 
 String _path(String rel) => '${_corpusRoot()!.path}/$rel';
+
+/// Maps the base name of an extracted entry to its source file inside the
+/// `dart_unrar/test_data` tree.
+String _sourceFor(String name) {
+  final root = _corpusRoot()!;
+  if (name == 'nested.txt') {
+    return '${root.path}/test_data/sources/subdir/nested.txt';
+  }
+  return '${root.path}/test_data/sources/$name';
+}
 
 Directory? _corpusRoot() {
   final cwd = Directory.current;

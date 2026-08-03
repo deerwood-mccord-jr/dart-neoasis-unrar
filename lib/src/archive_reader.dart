@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -8,6 +9,7 @@ import 'enc_name.dart';
 import 'header_constants.dart';
 import 'rar_time.dart';
 import 'raw_reader.dart';
+import 'unpacker.dart';
 import 'unrar_error.dart';
 
 /// A single parsed block header, mirroring the fields used by the C code's
@@ -20,6 +22,9 @@ class _BlockHeader {
 
   /// Size of the data area following the header (packed size for files).
   int dataSize = 0;
+
+  /// Absolute position of the data area following the header.
+  int dataOffset = 0;
 
   bool skipIfUnknown = false;
 
@@ -35,9 +40,13 @@ class _BlockHeader {
 /// headers; extra fields, encrypted headers and recovery records are future
 /// milestones.
 class ArchiveReader {
-  ArchiveReader(this._source);
+  ArchiveReader(this._source) : _unpacker = Unpacker(_source);
 
   final ByteSource _source;
+
+  /// Shared decompressor, reused across entries so the RAR 5.0/7.0 window
+  /// state carries through solid streams.
+  final Unpacker _unpacker;
 
   RarFormat _format = RarFormat.rarFmtNone;
   final ArchiveInfo _info = ArchiveInfo();
@@ -48,8 +57,12 @@ class ArchiveReader {
 
   // CurBlockPos / NextBlockPos in the C code.
   int _blockPos = 0;
+
   int _nextBlockPos = 0;
 
+  /// Absolute position of the first block after the main header, used to
+  /// rewind before extraction.
+  int _firstBlockPos = 0;
   RarFormat get format => _format;
 
   ArchiveInfo get info => _info;
@@ -143,6 +156,15 @@ class ArchiveReader {
     if (_brokenHeader) {
       throw const UnrarHeaderException('Main archive header is corrupt');
     }
+
+    _firstBlockPos = _nextBlockPos;
+    await _seekToNext();
+  }
+
+  /// Repositions the reader to the first block after the main header.
+  Future<void> _rewind() async {
+    _blockPos = _firstBlockPos;
+    await _source.seek(_firstBlockPos);
   }
 
   /// Returns the list of file entries (skipping service blocks), positioned
@@ -169,6 +191,100 @@ class ArchiveReader {
   }
 
   Future<void> close() => _source.close();
+
+  /// Extracts every file entry in archive order, invoking [onFile] with each
+  /// entry and its fully unpacked, CRC-verified bytes. Directories and
+  /// service blocks are skipped. Throws [UnsupportedMethodException] for
+  /// unsupported compression methods and [UnrarException] on CRC mismatches.
+  Future<void> extractAll(
+      FutureOr<void> Function(ArchiveEntry entry, Uint8List data) onFile) async {
+    if (!_initialized) {
+      await init();
+    } else {
+      await _rewind();
+    }
+    while (true) {
+      final head = await _readHeader();
+      if (head == null || head.type == HeaderType.headEndArc) {
+        break;
+      }
+      final entry = head.entry;
+      if (entry != null && !entry.isDirectory) {
+        final data = await _unpackEntry(entry, head);
+        await onFile(entry, data);
+      }
+      await _seekToNext();
+    }
+  }
+
+  /// Extracts the first file entry named [name], or `null` if not present.
+  ///
+  /// Header positions let us seek straight to the data of non-solid entries,
+  /// so they are extracted without touching preceding files. Compressed
+  /// entries of a solid stream depend on the files before them, so those are
+  /// unpacked first to keep the decompressor's window state consistent.
+  Future<Uint8List?> extractFile(String name) async {
+    if (!_initialized) {
+      await init();
+    } else {
+      await _rewind();
+    }
+    while (true) {
+      final head = await _readHeader();
+      if (head == null || head.type == HeaderType.headEndArc) {
+        return null;
+      }
+      final entry = head.entry;
+      if (entry != null && !entry.isDirectory) {
+        if (entry.name == name) {
+          return _unpackEntry(entry, head);
+        }
+        // In a solid archive every compressed file shares one LZ window with
+        // the files before it (the first file of the stream has no solid
+        // flag), so unpack-and-discard them to keep the decompressor state
+        // consistent for the requested entry.
+        if (_info.solid && entry.method != 0) {
+          await _unpackEntry(entry, head);
+        }
+      }
+      await _seekToNext();
+    }
+  }
+
+  /// Verifies the archive structure and every entry's CRC32, returning
+  /// `true` when all checks pass. Throws [UnsupportedMethodException] if any
+  /// entry uses a compression method that cannot be verified yet.
+  Future<bool> testArchive() async {
+    var ok = true;
+    await extractAll((entry, data) {
+      // CRC verification happens inside extractAll's unpack path.
+    });
+    if (_brokenHeader) {
+      ok = false;
+    }
+    return ok;
+  }
+
+  Future<Uint8List> _unpackEntry(ArchiveEntry entry, _BlockHeader head) async {
+    if (entry.isEncrypted) {
+      throw const UnrarException('Encrypted file data is not supported yet');
+    }
+    if (entry.splitBefore || entry.splitAfter) {
+      throw const UnrarException(
+          'Split entries (multi-volume files) are not supported yet');
+    }
+    return _unpacker.unpack(
+      method: entry.method,
+      packSize: head.dataSize,
+      unpSize: entry.unpSize,
+      unknownUnpSize: entry.unknownUnpSize,
+      dataOffset: head.dataOffset,
+      expectedCrc: entry.crc32,
+      unpVer: entry.unpVer,
+      windowSize: entry.windowSize,
+      solid: entry.isSolid,
+    );
+  }
 
   Future<void> _seekToNext() => _source.seek(_nextBlockPos);
 
@@ -222,6 +338,7 @@ class ArchiveReader {
     await raw.read(head.headSize - sizofShortBlockHead);
 
     _nextBlockPos = _blockPos + head.headSize;
+    head.dataOffset = _nextBlockPos;
 
     switch (head.type) {
       case HeaderType.headMain:
@@ -454,6 +571,7 @@ class ArchiveReader {
 
     _nextBlockPos = (_blockPos + head.headSize) & 0xFFFFFFFFFFFFFFFF;
     _nextBlockPos = (_nextBlockPos + dataSize) & 0xFFFFFFFFFFFFFFFF;
+    head.dataOffset = _blockPos + head.headSize;
 
     switch (head.type) {
       case HeaderType.headCrypt:
@@ -549,9 +667,11 @@ class ArchiveReader {
 
     final isDir = (fileFlags & fhflDirectory) != 0;
     var windowSize = 0;
-    if (!isDir && unpVer <= 1) {
+    // The mask uses the raw unpack version (0 for RAR 5.0, 1 for RAR 7.0),
+    // not the parsed [verPack5]/[verPack7] values.
+    if (!isDir && unpVerRaw <= 1) {
       windowSize =
-          0x20000 << ((compInfo >> 10) & (unpVer == verPack5 ? 0x0f : 0x1f));
+          0x20000 << ((compInfo >> 10) & (unpVerRaw == 0 ? 0x0f : 0x1f));
     }
 
     final isEncrypted = extraSize != 0 && _processExtra50(raw, extraSize);

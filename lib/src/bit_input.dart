@@ -17,6 +17,21 @@ class BitInput {
 
   BitInput() : _buffer = Uint8List(maxSize + 8);
 
+  /// Wraps a fully-loaded compressed stream so the decoder can read it
+  /// directly, without the fixed 32 KiB refill loop (mirrors the C
+  /// `SetExternalBuffer` mode used by the multi-threaded unpacker).
+  ///
+  /// Extra zero bytes are appended so the 64-bit readers can over-read
+  /// safely at the end of the stream even for tiny or damaged blocks.
+  BitInput.external(Uint8List data)
+      : _buffer = _padExternal(data);
+
+  static Uint8List _padExternal(Uint8List data) {
+    final padded = Uint8List(data.length + 16);
+    padded.setRange(0, data.length, data);
+    return padded;
+  }
+
   /// The input buffer. Compressed data is loaded into this buffer before
   /// reading bits; 8 extra bytes are kept zeroed so the 64-bit readers can
   /// over-read safely, mirroring the C constructor.

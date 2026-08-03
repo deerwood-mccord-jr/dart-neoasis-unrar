@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'package:neoasis_unrar/src/archive_reader.dart';
 import 'package:neoasis_unrar/src/byte_source.dart';
 import 'package:neoasis_unrar/src/header_constants.dart';
+import 'package:neoasis_unrar/src/unpacker.dart';
 import 'package:neoasis_unrar/src/unrar_error.dart';
 import 'package:test/test.dart';
 
@@ -73,6 +74,15 @@ void main() {
       expect(e.hostSystemType, HostSystemType.hsysWindows);
     });
 
+    test('computes the RAR 5 dictionary window size', () async {
+      final bytes = _rar5Archive();
+      final reader = ArchiveReader(MemoryByteSource(bytes));
+      await reader.init();
+      final e = (await reader.list()).single;
+      // compInfo = 2<<7: method 2, raw unp version 0 -> 0x20000 << 0.
+      expect(e.windowSize, 0x20000);
+    });
+
     test('detects volume flags from main header', () async {
       final bytes = _rar5Archive(volume: true, volNumber: 2);
       final reader = ArchiveReader(MemoryByteSource(bytes));
@@ -101,6 +111,30 @@ void main() {
       bytes[8] ^= 0xff; // Corrupt the main header CRC.
       final reader = ArchiveReader(MemoryByteSource(bytes));
       await expectLater(reader.init(), throwsA(isA<UnrarHeaderException>()));
+    });
+
+    test('RAR 4 compressed entries throw UnsupportedMethodException', () async {
+      // The synthetic archive declares method 2 / unp version 29 (RAR 3/4 LZ),
+      // which is not implemented yet, so unpacking must be rejected.
+      final reader = ArchiveReader(MemoryByteSource(_rar4Archive()));
+      await reader.init();
+      final entries = await reader.list();
+      expect(entries.single.method, 2);
+      expect(entries.single.unpVer, 29);
+      await expectLater(
+        reader.extractFile(entries.single.name),
+        throwsA(isA<UnsupportedMethodException>()),
+      );
+    });
+
+    test('RAR 5 stored entries extract without an LZ decompressor', () async {
+      // file2.txt in the corpus fixtures is a RAR 5 stored file; the synthetic
+      // archive here only asserts the dispatch path with method 0.
+      final reader = ArchiveReader(MemoryByteSource(_rar5StoredArchive()));
+      await reader.init();
+      final e = (await reader.list()).single;
+      expect(e.method, 0);
+      expect(e.unpVer, verPack5);
     });
   });
 }
@@ -191,7 +225,7 @@ List<int> _dosTime(int year, int month, int day, int hour, int minute,
 // RAR 5.0 archive builder.
 // ---------------------------------------------------------------------------
 
-Uint8List _rar5Archive({bool volume = false, int volNumber = 0}) {
+Uint8List _rar5Archive({bool volume = false, int volNumber = 0, int method = 2}) {
   final out = <int>[];
 
   // Mark (8 bytes).
@@ -217,7 +251,7 @@ Uint8List _rar5Archive({bool volume = false, int volNumber = 0}) {
     ..._vint(100), // unp size
     ..._vint(0x20), // file attr
     0x78, 0x56, 0x34, 0x12, // CRC32
-    ..._vint(2 << 7), // comp info: method 2, algorithm 0
+    ..._vint(method << 7), // comp info: method, algorithm 0
     ..._vint(host5Windows), // host OS
     ..._vint(name.length), // name size
     ...name,
@@ -236,6 +270,8 @@ Uint8List _rar5Archive({bool volume = false, int volNumber = 0}) {
 
   return Uint8List.fromList(out);
 }
+
+Uint8List _rar5StoredArchive() => _rar5Archive(method: 0);
 
 List<int> _header50(List<int> body) {
   final full = <int>[

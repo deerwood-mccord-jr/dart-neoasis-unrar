@@ -48,7 +48,7 @@ header-level metadata.
 - Integration tests against a corpus of real archives (names/order/sizes
   verified against `unrar` 7.x) and self-contained volume fixtures
 
-## 3. Extraction: stored files + verification — ⬜ planned
+## 3. Extraction: stored files + verification — ✅ done (uncommitted)
 
 Decompress nothing, but ship the extraction pipeline so the API shape and
 CRC verification land first.
@@ -61,20 +61,35 @@ CRC verification land first.
 - Stream out unpacked bytes via a sink/callback (pure Dart, no file I/O in core)
 - `extractFile` / `extractAll` / `testArchive` API surface (`extract.cpp`
   behavior)
+- Per-header `dataOffset` tracking (absolute) so `extractFile` can seek
+  straight to a file's data — this also makes stored solid archives work;
+  reader rewinds to just past the main header before extracting
+- Byte-exact integration tests against stored corpus archives (RAR 4.x and
+  5.0, solid and non-solid) plus `extract_archive.dart` example CLI
 
-## 4. Extraction: RAR 5.0 decompression — ⬜ planned
+## 4. Extraction: RAR 5.0/7.0 decompression — ✅ done (uncommitted)
 
-The largest single milestone. RAR 5.0 uses a custom LZ77-family decoder
-(distance caches, length tables, filters).
+The largest single milestone. RAR 5.0/7.0 uses a custom LZ77-family decoder
+(distance caches, length tables, filters, decode tables).
 
-- `Unpack50` main decode loop, window management, match/literal decoding
-  (`unpack50.cpp`, `unpack50frag.cpp`)
+- `Unpack50` main decode loop, window management, match/literal decoding,
+  decode tables + quick tables (`unpack50.cpp`, `unpack50frag.cpp`,
+  `make_decode_tables.cpp`)
 - Distance caches (recent distances, dist cache) and length tables
-- Program/virtual-machine filter model used for delta/audio/image filters —
-  decide: port the RAR VM fully (`rarvm.cpp`, `rarvm.hpp`, `model.cpp`,
-  `model.hpp`, `suballoc.cpp`) or target uncompressed/store + standard
-  compressed entries first
-- Optional multi-threaded variant (`unpack50mt.cpp`) — defer; document
+- Standard filters: delta, LZ (incl. 80-code DCX variant), ARM, SPARC, IA64,
+  PPC, RISC-V — replaces the RAR VM (only the VM-based RAR 4.x filters are
+  deferred to the RAR 4.x milestone)
+- RAR 7.0 specifics: `UnpVer 70` decode tables, DCX (`ExtraDist`), 64-bit
+  dict size limit (`UNPACK_MAX_DICT`)
+- Solid-stream window carry: one persistent decompressor per archive, prior
+  entries unpack-and-discarded so later entries' matches resolve correctly
+  (`archive_reader.dart` gated on the main-header solid flag)
+- External-buffer input mode with safe zero padding (`BitInput.external`) and
+  RAR 5.0 dict-size computation from raw `unpVerRaw`
+- Byte-exact integration tests: `basic_rar5.rar`, `with_dirs.rar`, `solid.rar`
+  (147/141/125-byte files verified byte-for-byte and by CRC against `unrar`
+  7.x); `UnsupportedMethodException` dispatch covered synthetically for RAR 4.x
+  (RAR 7.x cannot produce RAR 4 archives, see §5)
 
 ## 5. Extraction: RAR 4.x decompression — ⬜ planned
 
@@ -85,6 +100,9 @@ Two families, versioned by `UnpVer`.
   `model.hpp`, `suballoc.cpp`)
 - v15 (RAR 1.5) legacy decoder (`unpack15.cpp`) — small but optional
 - Old-version decoders gated by header `UnpVer` like the C code
+- Note: RAR 7.x can no longer create RAR 4 archives, so the corpus cannot
+  provide real RAR 4 compressed files; tests rely on synthetic archives and
+  the `UnsupportedMethodException` dispatch path (already wired in `Unpacker`)
 
 ## 6. Encryption — ⬜ planned
 
