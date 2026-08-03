@@ -1,0 +1,9 @@
+name: neoasis_unrar
+description: A pure Dart implementation of the UnRAR library for reading RAR archives, ported from the official RARLAB C source code.
+version: 0.1.0
+environment:
+  sdk: ">=3.5.0 <4.0.0"
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.24.0
