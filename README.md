@@ -8,7 +8,9 @@ in any Dart environment, including Flutter on all platforms and the web.
 
 ## Status
 
-This is an early-stage port. Current milestone: **scaffold + core foundation**.
+This is an early-stage port. Current milestone: **archive reading + listing**
+(extraction, encryption, and recovery records are planned — see
+[MILESTONES.md](MILESTONES.md)).
 
 Implemented (ported and unit-tested):
 - CRC32 and the legacy RAR 1.4 checksum (`crc.cpp`)
@@ -23,6 +25,8 @@ Implemented (ported and unit-tested):
 Not yet implemented (future milestones):
 - Data extraction (decompression), headers encryption, RAR 1.4 support,
   recovery records, extra fields (links, owners, streams), and more.
+
+See [MILESTONES.md](MILESTONES.md) for the full roadmap.
 
 ## Usage
 
