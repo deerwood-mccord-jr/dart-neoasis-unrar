@@ -48,7 +48,7 @@ header-level metadata.
 - Integration tests against a corpus of real archives (names/order/sizes
   verified against `unrar` 7.x) and self-contained volume fixtures
 
-## 3. Extraction: stored files + verification — ✅ done (uncommitted)
+## 3. Extraction: stored files + verification — ✅ done (commit `f75c133`)
 
 Decompress nothing, but ship the extraction pipeline so the API shape and
 CRC verification land first.
@@ -67,7 +67,7 @@ CRC verification land first.
 - Byte-exact integration tests against stored corpus archives (RAR 4.x and
   5.0, solid and non-solid) plus `extract_archive.dart` example CLI
 
-## 4. Extraction: RAR 5.0/7.0 decompression — ✅ done (uncommitted)
+## 4. Extraction: RAR 5.0/7.0 decompression — ✅ done (commit `f75c133`)
 
 The largest single milestone. RAR 5.0/7.0 uses a custom LZ77-family decoder
 (distance caches, length tables, filters, decode tables).
