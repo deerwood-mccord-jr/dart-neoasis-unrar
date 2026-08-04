@@ -141,6 +141,185 @@ void main() {
     });
   });
 
+  // ---------------------------------------------------------------------------
+  // M6 Encryption tests
+  // ---------------------------------------------------------------------------
+
+  group('RAR 5.0 data encryption (encrypted_data.rar)', () {
+    // The corpus fixture has two compressed+encrypted files created by
+    // `rar a -ptest123`. Password check and HMAC-SHA256 MAC are both present.
+    const password = 'test123';
+    const archivePath = 'test_data/encrypted_data.rar';
+
+    test('wrong password throws UnrarException', () async {
+      final archive =
+          await openRarFile(_path(archivePath), password: 'wrong');
+      addTearDown(archive.close);
+      final entries = await archive.list();
+      await expectLater(
+        archive.extractFile(entries.first.name),
+        throwsA(isA<UnrarException>()),
+      );
+    });
+
+    test('extracts hello.txt byte-exact with correct password', () async {
+      final archive =
+          await openRarFile(_path(archivePath), password: password);
+      addTearDown(archive.close);
+      final hello = await archive
+          .extractFile('Users/dmccordjr/DevProjects/flutterprojects/'
+              'dart_unrar/test_data/sources/hello.txt');
+      expect(hello, isNotNull);
+      expect(
+          hello,
+          File(_sourceFor('hello.txt')).readAsBytesSync(),
+          reason: 'hello.txt content mismatch');
+    });
+
+    test('extractAll extracts both files byte-exact', () async {
+      final archive =
+          await openRarFile(_path(archivePath), password: password);
+      addTearDown(archive.close);
+      final extracted = <String, List<int>>{};
+      await archive.extractAll((entry, data) {
+        extracted[entry.name.split('/').last] = data;
+      });
+      expect(extracted.keys.toSet(), {'hello.txt', 'world.txt'});
+      for (final name in ['hello.txt', 'world.txt']) {
+        expect(extracted[name], File(_sourceFor(name)).readAsBytesSync(),
+            reason: '$name content mismatch');
+      }
+    });
+
+    test('testArchive passes with correct password', () async {
+      final archive =
+          await openRarFile(_path(archivePath), password: password);
+      addTearDown(archive.close);
+      expect(await archive.testArchive(), isTrue);
+    });
+  });
+
+  group('RAR 5.0 header encryption (encrypted_headers.rar)', () {
+    // Created with `rar a -hp test123`. All headers are encrypted; the
+    // data uses plain CRC32 (no HASHMAC flag).
+    const password = 'test123';
+    const archivePath = 'test_data/encrypted_headers.rar';
+
+    test('opens successfully with correct password', () async {
+      final archive =
+          await openRarFile(_path(archivePath), password: password);
+      addTearDown(archive.close);
+      final entries = await archive.list();
+      expect(entries, hasLength(2));
+      expect(entries.every((e) => e.isEncrypted), isTrue);
+      expect(entries[0].unpSize, 147);
+      expect(entries[1].unpSize, 141);
+    });
+
+    test('throws wrong password on bad password', () async {
+      await expectLater(
+        openRarFile(_path(archivePath), password: 'wrong'),
+        throwsA(isA<UnrarException>()),
+      );
+    });
+
+    test('extractAll extracts both files byte-exact', () async {
+      final archive =
+          await openRarFile(_path(archivePath), password: password);
+      addTearDown(archive.close);
+      final extracted = <String, List<int>>{};
+      await archive.extractAll((entry, data) {
+        extracted[entry.name.split('/').last] = data;
+      });
+      expect(extracted.keys.toSet(), {'hello.txt', 'world.txt'});
+      for (final name in ['hello.txt', 'world.txt']) {
+        expect(extracted[name], File(_sourceFor(name)).readAsBytesSync(),
+            reason: '$name content mismatch');
+      }
+    });
+
+    test('testArchive passes', () async {
+      final archive =
+          await openRarFile(_path(archivePath), password: password);
+      addTearDown(archive.close);
+      expect(await archive.testArchive(), isTrue);
+    });
+  });
+
+  group('RAR 5.0 stored + encrypted (fixture enc_store.rar)', () {
+    // Method-0 (store) archive with encryption. The decrypted payload is
+    // just the raw plaintext + zero padding; no decompressor needed.
+    final fixturePath =
+        '${Directory.current.path}/test/fixtures/enc_store.rar';
+    const password = 'test123';
+    const expectedContent = 'hello world 0123456789\n';
+
+    test('extracts stored file byte-exact', () async {
+      final archive = await openRarFile(fixturePath, password: password);
+      addTearDown(archive.close);
+      final entries = await archive.list();
+      expect(entries, hasLength(1));
+      final data = await archive.extractFile(entries.single.name);
+      expect(data, isNotNull);
+      expect(String.fromCharCodes(data!), expectedContent);
+    });
+  });
+
+  group('RAR 4.x data encryption (crafted fixtures)', () {
+    // Fixtures were crafted at the binary level by make_rar4_enc.py /
+    // make_rar4_long.py using our kdf3 implementation. The CRC32 stored in
+    // the file header was computed from the plaintext by the same scripts,
+    // so our kdf3 + AES-128-CBC correctly reproduces the decrypted content.
+    final fixturesDir = '${Directory.current.path}/test/fixtures';
+
+    test('rar4_encrypted.rar extracts stored file with password test123',
+        () async {
+      final archive = await openRarFile(
+          '$fixturesDir/rar4_encrypted.rar',
+          password: 'test123');
+      addTearDown(archive.close);
+      final entries = await archive.list();
+      expect(entries, hasLength(1));
+      expect(entries.single.isEncrypted, isTrue);
+      // The plaintext is 'hello world, this is a secret message\n' * 3.
+      final data = await archive.extractFile(entries.single.name);
+      expect(data, isNotNull);
+      expect(
+          String.fromCharCodes(data!),
+          'hello world, this is a secret message\n' * 3);
+    });
+
+    test('rar4_longpwd.rar extracts with the long password', () async {
+      const longPwd =
+          'correct horse battery staple across many blocks 0123456789';
+      final archive = await openRarFile(
+          '$fixturesDir/rar4_longpwd.rar',
+          password: longPwd);
+      addTearDown(archive.close);
+      final entries = await archive.list();
+      expect(entries, hasLength(1));
+      expect(entries.single.isEncrypted, isTrue);
+      final data = await archive.extractFile(entries.single.name);
+      expect(data, isNotNull);
+      expect(data!.length, greaterThan(0));
+      expect(
+          String.fromCharCodes(data),
+          'long password test payload for rar29 mutation path\n' * 3);
+    });
+
+    test('wrong password throws UnrarException', () async {
+      final archive = await openRarFile(
+          '$fixturesDir/rar4_encrypted.rar',
+          password: 'wrongpwd');
+      addTearDown(archive.close);
+      final entries = await archive.list();
+      await expectLater(
+        archive.extractFile(entries.single.name),
+        throwsA(isA<UnrarException>()),
+      );
+    });
+  });
+
   group('real extraction (RAR 5 compressed)', () {
     // RAR 5.0 method 3 (deflate-style LZ) archives whose unpacked bytes must
     // exactly match the source files. solid.rar additionally exercises window

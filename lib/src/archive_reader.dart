@@ -2,13 +2,17 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
+import 'aes.dart';
 import 'archive_entry.dart';
 import 'archive_info.dart';
 import 'byte_source.dart';
 import 'enc_name.dart';
 import 'header_constants.dart';
+import 'kdf3.dart';
+import 'kdf5.dart';
 import 'rar_time.dart';
 import 'raw_reader.dart';
+import 'sha256.dart';
 import 'unpacker.dart';
 import 'unrar_error.dart';
 
@@ -37,12 +41,16 @@ class _BlockHeader {
 ///
 /// Supports RAR 4.x (RAR 1.5 format, `ReadHeader15`) and RAR 5.0
 /// (`ReadHeader50`) block layouts. Parsing is limited to the main and file
-/// headers; extra fields, encrypted headers and recovery records are future
-/// milestones.
+/// headers; encrypted headers require a password via [password].
 class ArchiveReader {
-  ArchiveReader(this._source) : _unpacker = Unpacker(_source);
+  ArchiveReader(this._source, {String? password})
+      : _password = password,
+        _unpacker = Unpacker(_source);
 
   final ByteSource _source;
+
+  /// Optional decryption password supplied by the caller.
+  final String? _password;
 
   /// Shared decompressor, reused across entries so the RAR 5.0/7.0 window
   /// state carries through solid streams.
@@ -63,6 +71,27 @@ class ArchiveReader {
   /// Absolute position of the first block after the main header, used to
   /// rewind before extraction.
   int _firstBlockPos = 0;
+
+  // --- RAR 5.0 archive-level encryption head (HEAD_CRYPT block) ---
+
+  /// 16-byte salt from HEAD_CRYPT (RAR 5.0 -hp).
+  List<int>? _rar5CryptSalt;
+
+  /// lg2Count from HEAD_CRYPT (RAR 5.0 -hp).
+  int _rar5CryptLg2 = 0;
+
+  /// Stored 8-byte pswCheck from HEAD_CRYPT (RAR 5.0 -hp).
+  List<int>? _rar5PswCheck;
+
+  /// Whether [_rar5PswCheck] is valid (digest verified).
+  bool _rar5UsePswCheck = false;
+
+  /// Derived AES-256 decryptor for RAR 5.0 encrypted headers.
+  AesCbcDecryptor? _rar5HeaderDecryptor;
+
+  // --- RAR 3 archive-level encryption salt (main-header -hp) ---
+  // (Stored for potential diagnostics; the derived key is in _rar3HeaderDecryptor.)
+
   RarFormat get format => _format;
 
   ArchiveInfo get info => _info;
@@ -145,8 +174,13 @@ class ArchiveReader {
     }
 
     if (_encrypted) {
-      throw const UnrarException(
-          'Encrypted archive headers are not supported yet');
+      if (_password == null) {
+        throw const UnrarException(
+            'Archive headers are encrypted: supply a password');
+      }
+      // For RAR 5.0 the HEAD_CRYPT block was already parsed and the derived
+      // decryptor is set; for RAR 4.x the decryptor is set when the 8-byte
+      // salt preamble is read in _readHeader15.
     }
 
     if (!mainFound) {
@@ -267,7 +301,14 @@ class ArchiveReader {
 
   Future<Uint8List> _unpackEntry(ArchiveEntry entry, _BlockHeader head) async {
     if (entry.isEncrypted) {
-      throw const UnrarException('Encrypted file data is not supported yet');
+      if (_password == null) {
+        throw const UnrarException(
+            'File is encrypted: supply a password to extract it');
+      }
+      if (entry.cryptInfo == null) {
+        throw const UnrarException(
+            'File is marked encrypted but has no crypto parameters');
+      }
     }
     if (entry.splitBefore || entry.splitAfter) {
       throw const UnrarException(
@@ -283,6 +324,8 @@ class ArchiveReader {
       unpVer: entry.unpVer,
       windowSize: entry.windowSize,
       solid: entry.isSolid,
+      password: _password,
+      cryptInfo: entry.cryptInfo,
     );
   }
 
@@ -312,12 +355,35 @@ class ArchiveReader {
     }
   }
 
+  // --- RAR 3 archive-level encryption decryptor for -hp headers ---
+  AesCbcDecryptor? _rar3HeaderDecryptor;
+
   // ---------------------------------------------------------------------
   // RAR 4.x (RAR 1.5 format) block reading.
   // ---------------------------------------------------------------------
 
   Future<_BlockHeader?> _readHeader15() async {
-    final raw = RawReader(_source);
+    // If the archive uses header encryption (-hp), the content after the
+    // mark starts with an 8-byte salt followed by AES-128-CBC encrypted
+    // header blocks. Mirror `Archive::ReadHeader15` from arcread.cpp.
+    final needsDecrypt = _encrypted && _blockPos > _sfxSize + sizofMarkHead3;
+
+    if (needsDecrypt && _rar3HeaderDecryptor == null) {
+      // First time: read the 8-byte salt and derive the key.
+      if (_password == null) {
+        throw const UnrarException(
+            'Archive headers are encrypted: supply a password');
+      }
+      final salt = await _readExact(sizeSalt30);
+      if (salt.length != sizeSalt30) {
+        return null;
+      }
+      final kdf = kdf3(_password, salt);
+      _rar3HeaderDecryptor =
+          AesCbcDecryptor(Aes.withKey(Uint8List.fromList(kdf.key)), kdf.init);
+    }
+
+    final raw = RawReader(_source, decryptor: needsDecrypt ? _rar3HeaderDecryptor : null);
     if (await raw.read(sizofShortBlockHead) == 0) {
       return null;
     }
@@ -419,17 +485,23 @@ class ArchiveReader {
     final rawName = raw.getB(readNameSize);
     final name = _decodeName15(rawName, head.flags);
 
+    if (isService) {
+      // Skip any remaining extra data and return null.
+      if ((head.flags & lhdSalt) != 0) {
+        raw.skip(sizeSalt30);
+      }
+      return null;
+    }
+
+    CryptInfo? cryptInfo;
     if ((head.flags & lhdSalt) != 0) {
-      raw.skip(sizeSalt30);
+      final salt = raw.getB(sizeSalt30);
+      cryptInfo = CryptInfo(isRar4: true, salt: salt);
     }
 
     var modifiedTime = dosTimeToDateTime(fileTime);
     if ((head.flags & lhdExtTime) != 0) {
       modifiedTime = _parseExtTime(raw, fileTime, modifiedTime);
-    }
-
-    if (isService) {
-      return null;
     }
 
     final isDir = (head.flags & lhdWindowMask) == lhdDirectory;
@@ -460,6 +532,7 @@ class ArchiveReader {
           : hostOs < hostMax
               ? HostSystemType.hsysWindows
               : HostSystemType.hsysUnknown,
+      cryptInfo: cryptInfo,
     );
   }
 
@@ -516,7 +589,30 @@ class ArchiveReader {
   // ---------------------------------------------------------------------
 
   Future<_BlockHeader?> _readHeader50() async {
-    final raw = RawReader(_source);
+    // If the archive uses header encryption (-hp), after the HEAD_CRYPT block
+    // each subsequent header is prefixed with a 16-byte IV and the header
+    // data itself is AES-256-CBC encrypted. Mirror `Archive::ReadHeader50`.
+    AesCbcDecryptor? decryptor;
+    if (_encrypted && _blockPos > _sfxSize + sizofMarkHead5) {
+      if (_password == null) {
+        throw const UnrarException(
+            'Archive headers are encrypted: supply a password');
+      }
+      // Read per-header 16-byte initialization vector.
+      final ivBytes = await _readExact(sizeInitV);
+      if (ivBytes.length != sizeInitV) {
+        return null;
+      }
+      // Build decryptor using the archive-level derived key + this header's IV.
+      if (_rar5HeaderDecryptor == null) {
+        throw const UnrarException(
+            'HEAD_CRYPT block not found before encrypted header');
+      }
+      // Re-initialise with the per-header IV (the key stays the same).
+      decryptor = AesCbcDecryptor(_rar5HeaderDecryptor!.aes, ivBytes);
+    }
+
+    final raw = RawReader(_source, decryptor: decryptor);
     if (await raw.read(sizofShortBlockHead5) < sizofShortBlockHead5) {
       return null;
     }
@@ -539,12 +635,16 @@ class ArchiveReader {
       return null;
     }
 
-    await raw.read(sizeToRead);
+    // Only read more bytes if the buffer does not already cover the full header.
+    // (With encrypted headers the first aligned read may have over-buffered.)
+    if (raw.size < headerSize) {
+      await raw.read(sizeToRead);
+    }
     if (raw.size < headerSize) {
       return null; // Unexpected end of archive.
     }
 
-    final headerCrc = raw.getCRC50();
+    final headerCrc = raw.getCRC50(upTo: headerSize);
 
     head.type = _mapHeaderType50(raw.getV());
     head.flags = raw.getV();
@@ -573,10 +673,21 @@ class ArchiveReader {
     _nextBlockPos = (_nextBlockPos + dataSize) & 0xFFFFFFFFFFFFFFFF;
     head.dataOffset = _blockPos + head.headSize;
 
+    // For encrypted RAR 5.0 headers (mirrors `RawRead` crypt-aligned reads),
+    // the physical bytes consumed from the source are:
+    //   sizeInitV (IV) + alignedUp(headerSize) + dataSize
+    // rather than just headerSize + dataSize.
+    if (decryptor != null) {
+      final alignedHead = (head.headSize + 15) & ~15;
+      _nextBlockPos = _blockPos + sizeInitV + alignedHead + dataSize;
+      head.dataOffset = _blockPos + sizeInitV + alignedHead;
+    }
+
     switch (head.type) {
       case HeaderType.headCrypt:
         _encrypted = true;
         _info.encrypted = true;
+        _parseCryptHead50(raw);
         break;
       case HeaderType.headMain:
         _parseMainHeader50(raw);
@@ -602,8 +713,63 @@ class ArchiveReader {
     return head;
   }
 
-  void _parseMainHeader50(RawReader raw) {
-    _info.reset();
+  /// Parses the body of a RAR 5.0 `HEAD_CRYPT` block (archive encryption
+  /// header), mirroring the `case HEAD_CRYPT` branch in `ReadHeader50`.
+  ///
+  /// If a password is available, derives the AES-256 key and stores it in
+  /// [_rar5HeaderDecryptor] so subsequent header blocks can be decrypted.
+  void _parseCryptHead50(RawReader raw) {
+    final cryptVersion = raw.getV();
+    if (cryptVersion > 0) {
+      return; // Unknown encryption version; ignore.
+    }
+    final encFlags = raw.getV();
+    _rar5UsePswCheck = (encFlags & chflCryptPswCheck) != 0;
+    _rar5CryptLg2 = raw.get1();
+    if (_rar5CryptLg2 > 24) {
+      return;
+    }
+    _rar5CryptSalt = raw.getB(sizeSalt50);
+    List<int>? pswCheckStored;
+    if (_rar5UsePswCheck) {
+      pswCheckStored = raw.getB(sizePswCheck);
+      final csum = raw.getB(4);
+      // Verify the pswcheck checksum (SHA-256 of pswCheck, first 4 bytes).
+      final digest = sha256(pswCheckStored);
+      if (digest[0] != csum[0] ||
+          digest[1] != csum[1] ||
+          digest[2] != csum[2] ||
+          digest[3] != csum[3]) {
+        _rar5UsePswCheck = false;
+      } else {
+        _rar5PswCheck = pswCheckStored;
+      }
+    }
+
+    // Derive the archive-level header key if we have a password.
+    if (_password != null && _rar5CryptSalt != null) {
+      final pwd = _password;
+      final kdf = kdf5(pwd, _rar5CryptSalt!, _rar5CryptLg2);
+      // Validate password via pswCheck if available.
+      if (_rar5UsePswCheck && _rar5PswCheck != null) {
+        final pswCheck = _rar5PswCheck;
+        final computed = foldPswCheck(kdf.pswCheckValue);
+        for (var i = 0; i < sizePswCheck; i++) {
+          if (computed[i] != pswCheck![i]) {
+            throw const UnrarException(
+                'Wrong password for encrypted archive headers');
+          }
+        }
+      }
+      // Store a "template" decryptor holding the key. The per-header IV will
+      // be injected in _readHeader50 using decryptor.aes.
+      _rar5HeaderDecryptor = AesCbcDecryptor(
+          Aes.withKey(Uint8List.fromList(kdf.key)),
+          List<int>.filled(sizeInitV, 0));
+    }
+  }
+
+  void _parseMainHeader50(RawReader raw) {    _info.reset();
     final arcFlags = raw.getV();
     _info.volume = (arcFlags & mhflVolume) != 0;
     _info.solid = (arcFlags & mhflSolid) != 0;
@@ -674,7 +840,8 @@ class ArchiveReader {
           0x20000 << ((compInfo >> 10) & (unpVerRaw == 0 ? 0x0f : 0x1f));
     }
 
-    final isEncrypted = extraSize != 0 && _processExtra50(raw, extraSize);
+    final cryptInfo = extraSize != 0 ? _processExtra50(raw, extraSize, head.headSize) : null;
+    final isEncrypted = cryptInfo != null;
 
     return ArchiveEntry(
       name: name,
@@ -700,18 +867,24 @@ class ArchiveReader {
           : hostOs == host5Windows
               ? HostSystemType.hsysWindows
               : HostSystemType.hsysUnknown,
+      cryptInfo: cryptInfo,
     );
   }
 
   /// Parses the RAR 5.0 header extra area, mirroring `ProcessExtra50`, and
-  /// returns whether a file encryption (`FHEXTRA_CRYPT`) record was present.
-  bool _processExtra50(RawReader raw, int extraSize) {
-    final extraStart = raw.size - extraSize;
-    if (extraStart < raw.readPos) {
-      return false;
+  /// returns a [CryptInfo] if a file encryption (`FHEXTRA_CRYPT`) record was
+  /// present, or `null` otherwise.
+  ///
+  /// [headerSize] is the logical header size (not the block-aligned physical
+  /// size), so the extra area is correctly located even when the buffer is
+  /// larger than the header (e.g. when AES-CBC zero-padding is present).
+  CryptInfo? _processExtra50(RawReader raw, int extraSize, int headerSize) {
+    final extraStart = headerSize - extraSize;
+    if (extraStart < raw.readPos || extraStart < 0) {
+      return null;
     }
     raw.setPos(extraStart);
-    var isEncrypted = false;
+    CryptInfo? cryptInfo;
     while (raw.dataLeft >= 2) {
       final fieldSize = raw.getV();
       if (fieldSize <= 0 || raw.dataLeft == 0 || fieldSize > raw.dataLeft) {
@@ -720,14 +893,55 @@ class ArchiveReader {
       final nextPos = raw.readPos + fieldSize;
       final fieldType = raw.getV();
       if (nextPos - raw.readPos < 0) {
-        break; // Field type is longer than the declared field size.
+        break;
       }
       if (fieldType == fhExtraCrypt) {
-        isEncrypted = true;
+        cryptInfo = _parseFhExtraCrypt(raw, nextPos);
       }
       raw.setPos(nextPos);
     }
-    return isEncrypted;
+    return cryptInfo;
+  }
+
+  /// Parses a `FHEXTRA_CRYPT` record body (RAR 5.0), mirroring the
+  /// `case FHEXTRA_CRYPT` block in `ProcessExtra50`.
+  CryptInfo? _parseFhExtraCrypt(RawReader raw, int fieldEnd) {
+    final encVersion = raw.getV();
+    if (encVersion > 0) {
+      return null; // Unknown encryption version.
+    }
+    final flags = raw.getV();
+    final lg2 = raw.get1();
+    if (lg2 > 24) {
+      return null;
+    }
+    final salt = raw.getB(sizeSalt50);
+    final iv = raw.getB(sizeInitV);
+    final usePswCheck = (flags & chflCryptPswCheck) != 0;
+    final useHashKey = (flags & fhExtraCryptHashMac) != 0;
+    List<int>? pswCheck;
+    var validPswCheck = false;
+    if (usePswCheck && raw.readPos + sizePswCheck + 4 <= fieldEnd) {
+      final stored = raw.getB(sizePswCheck);
+      final csum = raw.getB(4);
+      final digest = sha256(stored);
+      if (digest[0] == csum[0] &&
+          digest[1] == csum[1] &&
+          digest[2] == csum[2] &&
+          digest[3] == csum[3]) {
+        pswCheck = stored;
+        validPswCheck = true;
+      }
+    }
+    return CryptInfo(
+      isRar4: false,
+      salt: salt,
+      iv: iv,
+      lg2Count: lg2,
+      pswCheck: pswCheck,
+      usePswCheck: validPswCheck,
+      useHashKey: useHashKey,
+    );
   }
 
   // ---------------------------------------------------------------------

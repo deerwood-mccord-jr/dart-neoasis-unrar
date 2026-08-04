@@ -82,6 +82,10 @@ const int ehflNextVolume = 0x0001;
 // RAR 5.0 encryption header flags.
 const int chflCryptPswCheck = 0x0001;
 
+// RAR 5.0 FHEXTRA_CRYPT flags.
+const int fhExtraCryptPswCheck = 0x0001;
+const int fhExtraCryptHashMac = 0x0002; // CRC32 in header is HMAC-SHA256 MAC.
+
 // RAR 5.0 header extra area record types.
 const int fhExtraCrypt = 0x01; // Encryption parameters.
 const int fhExtraHash = 0x02; // File hash.

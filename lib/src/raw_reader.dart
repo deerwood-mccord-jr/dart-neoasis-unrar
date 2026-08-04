@@ -1,4 +1,5 @@
 import 'byte_source.dart';
+import 'aes.dart';
 import 'crc.dart';
 import 'raw_int.dart';
 
@@ -8,10 +9,16 @@ import 'raw_int.dart';
 /// Data is appended from a [ByteSource] in chunks; individual fields are then
 /// pulled out with the `get*` methods. Fields read past the end of buffered
 /// data return zero, matching the C implementation.
+///
+/// When [decryptor] is supplied, bytes read from the [ByteSource] are decrypted
+/// (AES-128 or AES-256 CBC) before being appended to the buffer, mirroring
+/// `RawRead::SetCrypt`.
 class RawReader {
-  RawReader(this._source);
+  RawReader(this._source, {AesCbcDecryptor? decryptor})
+      : _decryptor = decryptor;
 
   final ByteSource _source;
+  final AesCbcDecryptor? _decryptor;
 
   final List<int> _data = [];
   int _dataSize = 0;
@@ -34,20 +41,28 @@ class RawReader {
     _readPos = 0;
     _dataSize = 0;
   }
-
   /// Reads up to [size] bytes from the source into the buffer, matching
-  /// `RawRead::Read(size_t)`.
+  /// `RawRead::Read(size_t)`. When a [decryptor] is set, the read size is
+  /// rounded UP to the next 16-byte multiple before reading from the source;
+  /// all decrypted bytes are buffered. This mirrors `RawRead::Read` with
+  /// `SetCrypt` in the RARLAB source (`rawread.cpp`).
   Future<int> read(int size) async {
     if (size <= 0) {
       return 0;
     }
-    final bytes = await _source.read(size);
+    // Round up to AES block boundary when decrypting.
+    final toRead =
+        _decryptor != null ? ((size + 15) & ~15) : size;
+    final bytes = await _source.read(toRead);
     if (bytes.isEmpty) {
       return 0;
     }
-    _data.addAll(bytes);
-    _dataSize += bytes.length;
-    return bytes.length;
+    final decrypted =
+        _decryptor != null ? _decryptor.decrypt(bytes) : bytes;
+    _data.addAll(decrypted);
+    _dataSize += decrypted.length;
+    // Report back only `size` bytes so callers see the requested size.
+    return (decrypted.length < size ? decrypted.length : size);
   }
 
   /// Appends an in-memory chunk, matching `RawRead::Read(byte*, size_t)`.
@@ -149,11 +164,15 @@ class RawReader {
   }
 
   /// Computes the RAR 5.0 block CRC, matching `GetCRC50`.
-  int getCRC50() {
-    if (_dataSize <= 4) {
+  ///
+  /// If [upTo] is provided, only bytes 4..[upTo] are included (used when the
+  /// buffer may contain AES-CBC zero-padding beyond the logical header end).
+  int getCRC50({int? upTo}) {
+    final end = upTo ?? _dataSize;
+    if (end <= 4) {
       return 0xffffffff;
     }
-    final crc = crc32(0xffffffff, _data, 4, _dataSize - 4);
+    final crc = crc32(0xffffffff, _data, 4, end - 4);
     return crc ^ 0xffffffff;
   }
 

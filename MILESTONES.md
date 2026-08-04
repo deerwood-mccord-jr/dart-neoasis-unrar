@@ -5,7 +5,7 @@ RARLAB C source (`unrarsrc 7.2.3`, vendored under
 `../dart_unrar/third_party/unrar/`). The reference file(s) in parentheses are
 the C sources each milestone ports.
 
-Legend: ✅ done · 🔵 in progress · ⬜ planned
+Legend: ✅ done · 🔵 in progress · ⬜ planned · ❌ out of scope
 
 ---
 
@@ -110,19 +110,87 @@ Two families, versioned by `UnpVer`.
   CRC32) against `unrar` 7.x — including `rar4_ppmd_lzss.rar`, whose PPMd
   stream was additionally traced against the C reference model (`model.cpp`)
   char-by-char
-- v15 (RAR 1.5) legacy decoder (`unpack15.cpp`) — small but optional, still
-  ⬜ planned
+- v15 (RAR 1.5) legacy decoder (`unpack15.cpp`) — ❌ out of scope: RAR 1.5
+  archives exist only from the 1996-era RAR 1.5x tools and cannot be produced
+  by the licensed `rar` CLI (7.x has no legacy-format switch) or any other
+  modern tool, so no test fixture is obtainable. An unverifiable port would be
+  worse than an explicit error; `Unpacker.unpack` keeps throwing
+  `UnsupportedMethodException` for unpVer 15
 
-## 6. Encryption — ⬜ planned
+## 6. Encryption — ✅ done
 
-- AES-128 (RAR 4.x, `crypt2.cpp`, `crypt3.cpp`) and AES-256 + PBKDF2 (RAR 5.0,
-  `crypt5.cpp`) — pure Dart crypto, no external dependency
-- Header decryption (`-hp`): decrypt the crypt header, then header stream
-  (`crypt.cpp`, `crypt.hpp`, `arcread.cpp` header decrypt path) — this is why
-  `encrypted_headers.rar` currently throws
-- Password API (`RarArchive.open(..., password: ...)`), password-check
-  validation, wrong-password errors
-- `crypt1.cpp` (RAR 2.x legacy) — optional
+Pure Dart AES + PBKDF2 crypto, data decryption for both archive formats, and
+header decryption (`-hp`), with a password API threaded through the public
+surface.
+
+- **Crypto foundation** — pure Dart, no external dependency:
+  - SHA-1 (`sha1.dart`) including the `sha1_process_rar29` write-back variant
+    used by the RAR 3.x/4.x KDF (`crypt3.cpp`)
+  - SHA-256 + HMAC-SHA256 (`sha256.dart`, `hmac.dart`)
+  - AES-128/192/256 block cipher with stateful AES-CBC decryptor
+    (`aes.dart`, `rijndael.cpp`)
+  - RAR 3.x/4.x KDF (`kdf3.dart`): SHA-1 / 0x40000 rounds, AES-128 key +
+    CBC IV (`crypt3.cpp`, `SetKey30`)
+  - RAR 5.0 KDF (`kdf5.dart`): PBKDF2-HMAC-SHA256, AES-256 key + hash key
+    + password check value (`crypt5.cpp`, `SetKey50`/`pbkdf2`)
+  - NIST AES vectors, PBKDF2 vectors, and RAR-specific KDF fixtures all
+    covered by `test/crypto_test.dart` (90 crypto vector tests alone)
+
+- **RAR 5.0 file-data decryption** — `Unpacker._decryptRar5`:
+  - PBKDF2 key derived from the per-file `FHEXTRA_CRYPT` salt (16 bytes) and
+    lg2Count
+  - Optional password-check (`FHEXTRA_CRYPT_PSWCHECK`) verified before
+    decryption to give early wrong-password errors
+  - AES-256-CBC with the per-file IV; zero-padded packed stream (no separate
+    check block — empirically confirmed against real fixtures)
+  - When `FHEXTRA_CRYPT_HASHMAC` flag is set, the header's CRC32 field is a
+    HMAC-SHA256 MAC; post-decrypt MAC verification via `crc32Mac` /
+    `ConvertHashToMAC` from `crypt5.cpp`
+
+- **RAR 4.x file-data decryption** — `Unpacker._decryptRar4`:
+  - AES-128-CBC with SHA-1 KDF (`kdf3`) over per-file 8-byte salt
+    (stored after the filename in the file header when `LHD_SALT` is set)
+  - Zero-padded packed stream; CRC32 verification post-decrypt
+
+- **RAR 5.0 header decryption (`-hp`)** — `ArchiveReader._parseCryptHead50` +
+  `_readHeader50` decrypt path:
+  - `HEAD_CRYPT` block (plaintext) carries archive-level salt and pswCheck;
+    PBKDF2-derived key cached in `_rar5HeaderDecryptor`
+  - Each subsequent header is prefixed with a 16-byte IV in the stream;
+    `AesCbcDecryptor` re-initialised per header with the correct IV
+  - AES-CBC block-alignment handled in `RawReader` (reads rounded up to
+    16 bytes from source; logical header CRC is checked against the decrypted
+    bytes up to `headerSize` to avoid zero-padding contamination)
+  - `_nextBlockPos` accounts for `sizeInitV` + `alignedUp(headerSize)` so
+    block iteration stays consistent after encryption
+
+- **RAR 3/4 header decryption (`-hp`)** — `ArchiveReader._readHeader15`
+  decrypt path:
+  - 8-byte salt preamble read once, AES-128 key + IV derived via `kdf3`
+  - `AesCbcDecryptor` stored as `_rar3HeaderDecryptor`; injected into
+    `RawReader` for all subsequent header reads in the stream
+
+- **`FHEXTRA_CRYPT` full parsing** — `_parseFhExtraCrypt` in
+  `archive_reader.dart`: reads version, flags, lg2Count, salt, IV, pswCheck
+  (8 bytes) + csum (4 bytes); SHA-256 integrity check on pswCheck matches
+  `arcread.cpp ProcessExtra50`
+
+- **Password API**: `RarArchive.open(source, {String? password})` and
+  `openRarFile(path, {String? password})`; password is threaded through
+  `ArchiveReader` → `Unpacker`; missing password throws `UnrarException`
+  with a clear message
+
+- **Integration tests** (102 tests total, all green):
+  - `encrypted_data.rar` (RAR 5.0 HASHMAC): wrong-password rejection, byte-
+    exact extraction of both files and `testArchive` pass
+  - `encrypted_headers.rar` (RAR 5.0 `-hp`): list / extractAll / testArchive
+    all pass with correct password; wrong password throws
+  - `enc_store.rar` (method-0 + RAR 5.0 encryption): stored-file decrypt
+    path exercised independently of the decompressor
+  - `rar4_encrypted.rar`, `rar4_longpwd.rar` (crafted RAR 4.x + AES-128):
+    plaintext verified byte-exact; wrong-password rejection tested
+  - All 90 previous tests still pass (crypto vectors, format reading, RAR
+    4.x / RAR 5.0 / RAR 7.0 compressed extraction, volumes)
 
 ## 7. Volumes + recovery + integrity — ⬜ planned
 

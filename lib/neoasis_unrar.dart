@@ -31,8 +31,13 @@ class RarArchive {
   final ArchiveReader _reader;
 
   /// Opens [source] and detects the archive format and main header.
-  static Future<RarArchive> open(ByteSource source) async {
-    final reader = ArchiveReader(source);
+  ///
+  /// Supply [password] for encrypted archives. If the archive has encrypted
+  /// headers (`-hp` in `rar`) the password is used to derive the header
+  /// decryption key; if only file data is encrypted it is used during
+  /// extraction. An [UnrarException] is thrown if the password is wrong.
+  static Future<RarArchive> open(ByteSource source, {String? password}) async {
+    final reader = ArchiveReader(source, password: password);
     await reader.init();
     return RarArchive._(reader);
   }

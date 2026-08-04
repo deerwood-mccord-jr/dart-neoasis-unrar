@@ -1,5 +1,47 @@
 import 'header_constants.dart';
 
+/// Encryption parameters parsed from a file's `FHEXTRA_CRYPT` extra record
+/// (RAR 5.0) or from the RAR 4.x per-file salt flag (`LHD_SALT`).
+///
+/// For RAR 5.0: mirrors `FileHeader::Salt`, `::InitV`, `::Lg2Count`,
+/// `::PswCheck`, `::UseHashKey` from `headers.hpp`.
+/// For RAR 4.x (`isRar4 == true`): only `salt` is populated (8 bytes);
+/// the AES-128 key and IV are derived by [kdf3] from the password + salt.
+class CryptInfo {
+  const CryptInfo({
+    required this.isRar4,
+    required this.salt,
+    this.iv,
+    this.lg2Count = 0,
+    this.pswCheck,
+    this.usePswCheck = false,
+    this.useHashKey = false,
+  });
+
+  /// `true` for RAR 4.x (AES-128, 8-byte salt); `false` for RAR 5.0
+  /// (AES-256 / PBKDF2, 16-byte salt + 16-byte IV).
+  final bool isRar4;
+
+  /// Salt bytes (8 for RAR 4.x, 16 for RAR 5.0).
+  final List<int> salt;
+
+  /// AES-256 CBC initialisation vector (RAR 5.0 only, 16 bytes).
+  final List<int>? iv;
+
+  /// log₂ of PBKDF2 iteration count (RAR 5.0 only).
+  final int lg2Count;
+
+  /// 8-byte password-check value (present when [usePswCheck] is `true`).
+  final List<int>? pswCheck;
+
+  /// `true` if [pswCheck] is valid and should be tested before decrypting.
+  final bool usePswCheck;
+
+  /// `true` when the header's CRC32 field is a HMAC-SHA256 MAC rather than a
+  /// plain CRC32 (RAR 5.0 `FHEXTRA_CRYPT_HASHMAC` flag).
+  final bool useHashKey;
+}
+
 /// A single entry (file or directory) inside a RAR archive, modeled on the
 /// `FileHeader` struct from the RARLAB UnRAR source (`headers.hpp`).
 class ArchiveEntry {
@@ -23,6 +65,7 @@ class ArchiveEntry {
     required this.unknownUnpSize,
     required this.isService,
     required this.hostSystemType,
+    this.cryptInfo,
   });
 
   /// Full path of the entry inside the archive.
@@ -79,6 +122,9 @@ class ArchiveEntry {
   final bool isService;
 
   final HostSystemType hostSystemType;
+
+  /// Encryption parameters; `null` for unencrypted entries.
+  final CryptInfo? cryptInfo;
 
   @override
   String toString() =>

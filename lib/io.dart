@@ -50,6 +50,7 @@ class FileByteSource implements ByteSource {
   }
 }
 
-/// Opens the RAR archive at [path] for reading.
-Future<RarArchive> openRarFile(String path) =>
-    RarArchive.open(FileByteSource(File(path)));
+/// Opens the RAR archive at [path] for reading. Supply [password] for
+/// encrypted archives (data or header encryption).
+Future<RarArchive> openRarFile(String path, {String? password}) =>
+    RarArchive.open(FileByteSource(File(path)), password: password);
