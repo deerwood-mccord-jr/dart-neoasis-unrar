@@ -91,18 +91,27 @@ The largest single milestone. RAR 5.0/7.0 uses a custom LZ77-family decoder
   7.x); `UnsupportedMethodException` dispatch covered synthetically for RAR 4.x
   (RAR 7.x cannot produce RAR 4 archives, see §5)
 
-## 5. Extraction: RAR 4.x decompression — ⬜ planned
+## 5. Extraction: RAR 4.x decompression — ✅ done (commit `ae25ce9`)
 
 Two families, versioned by `UnpVer`.
 
 - v20/v29 LZSS window decoder (`unpack20.cpp`, `unpackinline.cpp`)
 - v29 PPMd variant via the range coder + model (`unpack30.cpp`, `model.cpp`,
   `model.hpp`, `suballoc.cpp`)
-- v15 (RAR 1.5) legacy decoder (`unpack15.cpp`) — small but optional
-- Old-version decoders gated by header `UnpVer` like the C code
+- Old-version decoders gated by header `UnpVer` like the C code; dispatch wired
+  in `Unpacker` for unpVer 20/26/29, including solid-stream state reuse
+  (`Rar4Unpacker`)
+- Shared `DecodeNumber`/`MakeDecodeTables` factored out of `unpack5.dart` for
+  both RAR 4.x and RAR 5.0; `Unpack::GetChar` byte-wise reader added to
+  `BitInput` for the PPMd range coder
 - Note: RAR 7.x can no longer create RAR 4 archives, so the corpus cannot
-  provide real RAR 4 compressed files; tests rely on synthetic archives and
-  the `UnsupportedMethodException` dispatch path (already wired in `Unpacker`)
+  provide real RAR 4 compressed files; instead we rely on the libarchive RAR 4
+  corpus (`test/fixtures/libarchive/rar4_*.rar`) verified byte-exact (size +
+  CRC32) against `unrar` 7.x — including `rar4_ppmd_lzss.rar`, whose PPMd
+  stream was additionally traced against the C reference model (`model.cpp`)
+  char-by-char
+- v15 (RAR 1.5) legacy decoder (`unpack15.cpp`) — small but optional, still
+  ⬜ planned
 
 ## 6. Encryption — ⬜ planned
 

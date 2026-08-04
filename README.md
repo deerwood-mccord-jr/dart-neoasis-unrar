@@ -8,9 +8,9 @@ in any Dart environment, including Flutter on all platforms and the web.
 
 ## Status
 
-This is an early-stage port. Current milestone: **RAR 5.0/7.0 extraction
-including compressed data** (RAR 4.x decompression, encryption, and recovery
-records are still planned — see [MILESTONES.md](MILESTONES.md)).
+This is an early-stage port. Current milestone: **RAR 4.x and RAR 5.0/7.0
+extraction including compressed data** (encryption and recovery records are
+still planned — see [MILESTONES.md](MILESTONES.md)).
 
 Implemented (ported and unit-tested):
 - CRC32 and the legacy RAR 1.4 checksum (`crc.cpp`)
@@ -26,11 +26,13 @@ Implemented (ported and unit-tested):
   delta, LZ/DCX/ARM/SPARC/IA64/PPC/RISC-V filters, solid-stream window carry,
   and external-buffer input mode (`unpack5.cpp`, `unpackinline.cpp`) —
   `extractFile`, `extractAll`, `testArchive`
+- RAR 4.x decompression (unpVer 20/26/29): LZSS window decoder and the PPMd
+  range-coder + model variant, with solid-stream state reuse
+  (`unpack20.cpp`, `unpack30.cpp`, `model.cpp`, `suballoc.cpp`)
 
 Not yet implemented (future milestones):
-- RAR 4.x compressed-data decompression (LZSS/PPMd), header/data encryption,
-  RAR 1.4 support, multi-volume splicing, recovery records, extra fields
-  (links, owners, streams), and more.
+- Header/data encryption, RAR 1.5 support, multi-volume splicing, recovery
+  records, extra fields (links, owners, streams), and more.
 
 See [MILESTONES.md](MILESTONES.md) for the full roadmap.
 
