@@ -50,7 +50,45 @@ class FileByteSource implements ByteSource {
   }
 }
 
-/// Opens the RAR archive at [path] for reading. Supply [password] for
-/// encrypted archives (data or header encryption).
-Future<RarArchive> openRarFile(String path, {String? password}) =>
-    RarArchive.open(FileByteSource(File(path)), password: password);
+/// Returns a [VolumeResolver] that looks for the next volume as a file on the
+/// local file system. If [nextName] is a bare file name, it is resolved
+/// relative to the directory that contains [currentName].
+VolumeResolver fileVolumeResolver() {
+  return (String currentName, String nextName) async {
+    // Resolve relative paths: if nextName has no directory component, place
+    // it in the same directory as currentName.
+    final File nextFile;
+    if (nextName.contains('/') || nextName.contains('\\')) {
+      nextFile = File(nextName);
+    } else {
+      final dir = File(currentName).parent;
+      nextFile = File('${dir.path}/$nextName');
+    }
+    if (!nextFile.existsSync()) return null;
+    return FileByteSource(nextFile);
+  };
+}
+
+/// Opens the RAR archive at [path] for reading.
+///
+/// Supply [password] for encrypted archives (data or header encryption).
+/// Multi-volume archives are automatically continued when the next part is
+/// present alongside [path]; pass `autoVolume: false` to disable this, or
+/// supply a custom [volumeResolver] to override the default file-system
+/// resolver.
+Future<RarArchive> openRarFile(
+  String path, {
+  String? password,
+  bool autoVolume = true,
+  VolumeResolver? volumeResolver,
+}) {
+  final resolver =
+      volumeResolver ?? (autoVolume ? fileVolumeResolver() : null);
+  return RarArchive.open(
+    FileByteSource(File(path)),
+    password: password,
+    archiveName: path,
+    volumeResolver: resolver,
+  );
+}
+

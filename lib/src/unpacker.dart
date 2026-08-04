@@ -53,6 +53,92 @@ class Unpacker {
   ///
   /// When [expectedCrc] is non-zero the unpacked data is verified against it
   /// and a [UnrarException] is thrown on mismatch. When [password] and
+  /// Unpacks from a pre-assembled [data] buffer (used for multi-volume
+  /// entries where packed fragments have already been concatenated and
+  /// optionally decrypted by [ArchiveReader]).
+  ///
+  /// When [alreadyDecrypted] is `true` the buffer is passed directly to the
+  /// decompressor; otherwise [password] + [cryptInfo] are applied first.
+  Future<Uint8List> unpackFromBuffer({
+    required int method,
+    required int unpSize,
+    required bool unknownUnpSize,
+    required int expectedCrc,
+    int unpVer = verUnknown,
+    int windowSize = 0,
+    bool solid = false,
+    required Uint8List data,
+    String? password,
+    CryptInfo? cryptInfo,
+    bool alreadyDecrypted = false,
+  }) async {
+    Uint8List packed = data;
+    if (!alreadyDecrypted && cryptInfo != null && password != null) {
+      packed = _decryptPacked(data, password, cryptInfo, expectedCrc);
+    }
+
+    if (method == 0) {
+      final out = (!unknownUnpSize && packed.length > unpSize)
+          ? Uint8List.sublistView(packed, 0, unpSize)
+          : packed;
+      if (cryptInfo != null && password != null && cryptInfo.useHashKey) {
+        _verifyEncryptedCrc(out, cryptInfo, password, expectedCrc);
+      } else if (expectedCrc != 0) {
+        final actualCrc = crc32Of(out);
+        if (actualCrc != expectedCrc) {
+          throw UnrarException(
+              'CRC32 mismatch for split stored entry '
+              '(expected $expectedCrc, got $actualCrc)');
+        }
+      }
+      return out;
+    }
+
+    if (unpVer == verPack5 || unpVer == verPack7) {
+      final rar5 = _rar5 ??= Rar5Unpacker();
+      final out = rar5.unpack5(
+        packed: packed,
+        unpSize: unpSize,
+        windowSize: windowSize,
+        solid: solid,
+        extraDist: unpVer == verPack7,
+      );
+      if (cryptInfo != null && password != null && cryptInfo.useHashKey) {
+        _verifyEncryptedCrc(out, cryptInfo, password, expectedCrc);
+      } else if (expectedCrc != 0) {
+        final actualCrc = crc32Of(out);
+        if (actualCrc != expectedCrc) {
+          throw UnrarException(
+              'CRC32 mismatch for split compressed entry '
+              '(expected $expectedCrc, got $actualCrc)');
+        }
+      }
+      return out;
+    }
+
+    if (unpVer == 20 || unpVer == 26 || unpVer == 29) {
+      final rar4 = _rar4 ??= Rar4Unpacker();
+      final out = rar4.unpack4(
+        packed: packed,
+        unpSize: unpSize,
+        windowSize: windowSize,
+        solid: solid,
+        unpVer: unpVer,
+      );
+      if (expectedCrc != 0) {
+        final actualCrc = crc32Of(out);
+        if (actualCrc != expectedCrc) {
+          throw UnrarException(
+              'CRC32 mismatch for split compressed entry '
+              '(expected $expectedCrc, got $actualCrc)');
+        }
+      }
+      return out;
+    }
+
+    throw UnsupportedMethodException(method, data.length, unpSize);
+  }
+
   /// [cryptInfo] are supplied the packed data is decrypted before
   /// decompression.
   ///
@@ -88,6 +174,12 @@ class Unpacker {
     }
     throw UnsupportedMethodException(method, packSize, unpSize);
   }
+
+  /// Public wrapper around [_decryptPacked] used by [ArchiveReader] when
+  /// assembling multi-volume packed streams before decompression.
+  Uint8List decryptPacked(Uint8List packed, String password,
+          CryptInfo cryptInfo, int expectedCrc) =>
+      _decryptPacked(packed, password, cryptInfo, expectedCrc);
 
   /// Decrypts [packed] in-place when [cryptInfo] is present.
   ///

@@ -42,6 +42,30 @@ class CryptInfo {
   final bool useHashKey;
 }
 
+/// Unix owner and group information from `FHEXTRA_UOWNER`, mirroring
+/// `FileHeader::UnixOwnerSet` / `UnixOwnerName` / `UnixGroupName` from
+/// `headers.hpp`.
+class UnixOwnerInfo {
+  const UnixOwnerInfo({
+    this.ownerName,
+    this.groupName,
+    this.ownerId,
+    this.groupId,
+  });
+
+  /// String owner name (UTF-8), or `null` if not stored.
+  final String? ownerName;
+
+  /// String group name (UTF-8), or `null` if not stored.
+  final String? groupName;
+
+  /// Numeric user ID, or `null` if not stored.
+  final int? ownerId;
+
+  /// Numeric group ID, or `null` if not stored.
+  final int? groupId;
+}
+
 /// A single entry (file or directory) inside a RAR archive, modeled on the
 /// `FileHeader` struct from the RARLAB UnRAR source (`headers.hpp`).
 class ArchiveEntry {
@@ -66,6 +90,12 @@ class ArchiveEntry {
     required this.isService,
     required this.hostSystemType,
     this.cryptInfo,
+    this.createdTime,
+    this.accessedTime,
+    this.redirectType = FileSystemRedirect.fsRedirNone,
+    this.redirectTarget,
+    this.redirectTargetIsDir = false,
+    this.unixOwner,
   });
 
   /// Full path of the entry inside the archive.
@@ -97,6 +127,12 @@ class ArchiveEntry {
   /// Modification time, or `null` if not stored.
   final DateTime? modifiedTime;
 
+  /// File creation time from `FHEXTRA_HTIME`, or `null` if not stored.
+  final DateTime? createdTime;
+
+  /// Last-access time from `FHEXTRA_HTIME`, or `null` if not stored.
+  final DateTime? accessedTime;
+
   /// Compression method (0 - 5).
   final int method;
 
@@ -125,6 +161,25 @@ class ArchiveEntry {
 
   /// Encryption parameters; `null` for unencrypted entries.
   final CryptInfo? cryptInfo;
+
+  /// File system redirect type from `FHEXTRA_REDIR`; [FileSystemRedirect.fsRedirNone]
+  /// when no redirection is present.
+  final FileSystemRedirect redirectType;
+
+  /// Target path for a file system redirect (symlink, junction, hard link …).
+  /// `null` when [redirectType] is [FileSystemRedirect.fsRedirNone].
+  final String? redirectTarget;
+
+  /// `true` when the redirect target itself is a directory (the
+  /// `FHEXTRA_REDIR_DIR` flag in RAR 5.0).
+  final bool redirectTargetIsDir;
+
+  /// `true` if this entry is any kind of file-system link (symlink, junction,
+  /// hard link, or file copy).
+  bool get isRedirect => redirectType != FileSystemRedirect.fsRedirNone;
+
+  /// Unix owner/group information from `FHEXTRA_UOWNER`; `null` if absent.
+  final UnixOwnerInfo? unixOwner;
 
   @override
   String toString() =>

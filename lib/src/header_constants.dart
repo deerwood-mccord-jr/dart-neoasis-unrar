@@ -108,7 +108,21 @@ const List<int> subheadTypeQOpen = [0x51, 0x4f]; // "QO"
 const List<int> subheadTypeRr = [0x52, 0x52]; // "RR"
 const List<int> subheadTypeUOwner = [0x55, 0x4f, 0x57]; // "UOW"
 
-// Encryption sizes.
+// RAR 5.0 FHEXTRA_HTIME flags.
+const int fhExtraHtimeUnixTime = 0x01;
+const int fhExtraHtimeMtime = 0x02;
+const int fhExtraHtimeCtime = 0x04;
+const int fhExtraHtimeAtime = 0x08;
+const int fhExtraHtimeUnixNs = 0x10;
+
+// RAR 5.0 FHEXTRA_UOWNER flags.
+const int fhExtraUownerNumUid = 0x01;
+const int fhExtraUownerNumGid = 0x02;
+const int fhExtraUownerUname = 0x04;
+const int fhExtraUownerGname = 0x08;
+
+// RAR 5.0 FHEXTRA_REDIR flags.
+const int fhExtraRedirDir = 0x01;
 const int sizeSalt50 = 16;
 const int sizeSalt30 = 8;
 const int sizeInitV = 16;

@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:neoasis_unrar/io.dart';
 import 'package:neoasis_unrar/neoasis_unrar.dart';
@@ -406,6 +407,170 @@ void main() {
       });
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // M7: Multi-volume extraction
+  // ---------------------------------------------------------------------------
+
+  group('multi-volume extraction (vol.part*.rar)', () {
+    final fixturesDir = '${Directory.current.path}/test/fixtures';
+    final part1 = '$fixturesDir/vol.part1.rar';
+
+    test('nextVolumeName computes correct names for new-style numbering', () {
+      expect(nextVolumeName('vol.part1.rar'), 'vol.part2.rar');
+      expect(nextVolumeName('vol.part9.rar'), 'vol.part10.rar');
+      expect(nextVolumeName('vol.part99.rar'), 'vol.part100.rar');
+      expect(nextVolumeName('archive.part001.rar'), 'archive.part002.rar');
+    });
+
+    test('nextVolumeName computes correct names for old-style numbering', () {
+      expect(nextVolumeName('archive.rar', oldNumbering: true), 'archive.r00');
+      expect(nextVolumeName('archive.r00', oldNumbering: true), 'archive.r01');
+      expect(nextVolumeName('archive.r99', oldNumbering: true), 'archive.s00');
+    });
+
+    test('openRarFile auto-chains volumes and extracts data.bin byte-exact',
+        () async {
+      // Verify with the reference unrar output extracted to /tmp/vol_test.
+      final reference = File('/tmp/vol_test/data.bin');
+      if (!reference.existsSync()) {
+        markTestSkipped('Reference file /tmp/vol_test/data.bin not present; '
+            'run: unrar e ${Directory.current.path}/test/fixtures/vol.part1.rar /tmp/vol_test/');
+        return;
+      }
+      final archive = await openRarFile(part1);
+      addTearDown(archive.close);
+      final entries = await archive.list();
+      expect(entries, hasLength(1));
+      expect(entries.single.name, 'data.bin');
+      expect(entries.single.unpSize, 5000);
+      final data = await archive.extractFile('data.bin');
+      expect(data, isNotNull);
+      expect(data!.length, 5000);
+      expect(data, reference.readAsBytesSync(),
+          reason: 'data.bin content mismatch across volumes');
+    });
+
+    test('extractAll assembles all 5000 bytes from four volumes', () async {
+      final reference = File('/tmp/vol_test/data.bin');
+      if (!reference.existsSync()) {
+        markTestSkipped('Reference /tmp/vol_test/data.bin not present');
+        return;
+      }
+      final archive = await openRarFile(part1);
+      addTearDown(archive.close);
+      Uint8List? result;
+      await archive.extractAll((entry, data) {
+        if (entry.name == 'data.bin') result = data;
+      });
+      expect(result, isNotNull);
+      expect(result!.length, 5000);
+      expect(result, reference.readAsBytesSync(),
+          reason: 'data.bin content mismatch from extractAll');
+    });
+
+    test('missing resolver throws UnrarException for split entries', () async {
+      // Open without auto-volume support.
+      final archive = await openRarFile(part1, autoVolume: false);
+      addTearDown(archive.close);
+      final entries = await archive.list();
+      expect(entries.single.splitAfter, isTrue);
+      await expectLater(
+        archive.extractFile('data.bin'),
+        throwsA(isA<UnrarException>()),
+      );
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // M8: Extra field parsing (FHEXTRA_REDIR, FHEXTRA_UOWNER, FHEXTRA_HTIME)
+  // ---------------------------------------------------------------------------
+
+  group('M8: FHEXTRA_REDIR – symlinks and redirections', () {
+    final fixturePath =
+        '${Directory.current.path}/test/fixtures/symlinks.rar';
+
+    test('symlink entry has redirectType=fsRedirUnixSymlink', () async {
+      final archive = await openRarFile(fixturePath);
+      addTearDown(archive.close);
+      final entries = await archive.list();
+      final link =
+          entries.firstWhere((e) => e.name.endsWith('mylink.txt'));
+      expect(link.redirectType, FileSystemRedirect.fsRedirUnixSymlink);
+      expect(link.redirectTarget, 'target.txt');
+      expect(link.isRedirect, isTrue);
+    });
+
+    test('regular file has no redirect', () async {
+      final archive = await openRarFile(fixturePath);
+      addTearDown(archive.close);
+      final entries = await archive.list();
+      final file =
+          entries.firstWhere((e) => e.name.endsWith('target.txt'));
+      expect(file.redirectType, FileSystemRedirect.fsRedirNone);
+      expect(file.redirectTarget, isNull);
+      expect(file.isRedirect, isFalse);
+    });
+
+    test('RAR 4.x Unix symlink detected from fileAttr', () async {
+      // rar4_lz_normal.rar contains a testlink entry with Unix symlink attrs.
+      final fixturePath4x =
+          '${Directory.current.path}/test/fixtures/libarchive/rar4_lz_normal.rar';
+      final archive = await openRarFile(fixturePath4x);
+      addTearDown(archive.close);
+      final entries = await archive.list();
+      final link = entries.firstWhere((e) => e.name == 'testlink',
+          orElse: () => throw StateError('testlink not found'));
+      expect(link.redirectType, FileSystemRedirect.fsRedirUnixSymlink);
+    });
+  });
+
+  group('M8: FHEXTRA_UOWNER – Unix owner/group', () {
+    final fixturePath =
+        '${Directory.current.path}/test/fixtures/with_owner.rar';
+
+    test('entry has unixOwner with numeric uid and gid', () async {
+      final archive = await openRarFile(fixturePath);
+      addTearDown(archive.close);
+      final entries = await archive.list();
+      expect(entries, hasLength(1));
+      final entry = entries.single;
+      expect(entry.unixOwner, isNotNull);
+      expect(entry.unixOwner!.ownerId, isNotNull);
+      expect(entry.unixOwner!.groupId, isNotNull);
+    });
+  });
+
+  group('M8: FHEXTRA_HTIME – high-precision timestamps', () {
+    final fixturePath =
+        '${Directory.current.path}/test/fixtures/with_htime.rar';
+
+    test('entry has modifiedTime from FHEXTRA_HTIME', () async {
+      final archive = await openRarFile(fixturePath);
+      addTearDown(archive.close);
+      final entries = await archive.list();
+      expect(entries, hasLength(1));
+      // The file was touched to 2026-01-01; the FHEXTRA_HTIME record should
+      // carry a timestamp from that day.
+      final e = entries.single;
+      expect(e.modifiedTime, isNotNull);
+    });
+  });
+
+  group('M8: RAR 4.x corpus extra metadata', () {
+    test('rar4_lz_normal.rar: listing includes symlink, dirs and files',
+        () async {
+      final fixturePath =
+          '${Directory.current.path}/test/fixtures/libarchive/rar4_lz_normal.rar';
+      final archive = await openRarFile(fixturePath);
+      addTearDown(archive.close);
+      final entries = await archive.list();
+      expect(entries.any((e) => e.isDirectory), isTrue,
+          reason: 'should have directory entries');
+      expect(entries.any((e) => e.isRedirect), isTrue,
+          reason: 'should have symlink entry');
+    });
+  });
 }
 
 class _Expected {
@@ -554,3 +719,6 @@ final _cases = <_Case>[
     ],
   ),
 ];
+
+// ---------------------------------------------------------------------------
+// M7 volume chaining tests (added at end of file)

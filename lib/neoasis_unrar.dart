@@ -15,12 +15,14 @@ export 'src/byte_source.dart';
 export 'src/header_constants.dart';
 export 'src/unpacker.dart';
 export 'src/unrar_error.dart';
+export 'src/volume.dart' show VolumeResolver, nextVolumeName;
 
 import 'src/archive_entry.dart';
 import 'src/archive_info.dart';
 import 'src/archive_reader.dart';
 import 'src/byte_source.dart';
 import 'src/header_constants.dart';
+import 'src/volume.dart';
 
 /// An open RAR archive. Stored files and RAR 5.0/7.0 compressed files can be
 /// extracted and CRC-verified; RAR 4.x compressed entries are not supported
@@ -36,8 +38,21 @@ class RarArchive {
   /// headers (`-hp` in `rar`) the password is used to derive the header
   /// decryption key; if only file data is encrypted it is used during
   /// extraction. An [UnrarException] is thrown if the password is wrong.
-  static Future<RarArchive> open(ByteSource source, {String? password}) async {
-    final reader = ArchiveReader(source, password: password);
+  ///
+  /// For multi-part archives supply [archiveName] (the name/path of the first
+  /// volume) and a [volumeResolver] that opens subsequent volumes on demand.
+  /// When [volumeResolver] is `null`, split entries throw [UnrarException].
+  /// `lib/io.dart`'s [openRarFile] automatically wires a file-system resolver.
+  static Future<RarArchive> open(
+    ByteSource source, {
+    String? password,
+    String? archiveName,
+    VolumeResolver? volumeResolver,
+  }) async {
+    final reader = ArchiveReader(source,
+        password: password,
+        archiveName: archiveName,
+        volumeResolver: volumeResolver);
     await reader.init();
     return RarArchive._(reader);
   }

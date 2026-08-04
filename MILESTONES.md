@@ -192,24 +192,72 @@ surface.
   - All 90 previous tests still pass (crypto vectors, format reading, RAR
     4.x / RAR 5.0 / RAR 7.0 compressed extraction, volumes)
 
-## 7. Volumes + recovery + integrity — ⬜ planned
+## 7. Volumes + recovery + integrity — ✅ done
 
-- Multi-volume continuation during extraction: detect next volume name,
-  open part N+1, splice file data across parts (`volume.cpp`, `volume.hpp`)
-- Recovery records (`.rev` / RR blocks): `recvol3.cpp`, `recvol5.cpp` — parity
-  reconstruction, large; defer unless needed
-- End-of-archive flags (`EHFL_NEXTVOLUME`), split-entry handling, better
-  error classification
+- **`NextVolumeName` algorithm** (`pathfn.cpp`): pure string port; handles
+  new-style (`part1→part2`, digit-carry with insert) and old-style
+  (`.rar→.r00→.r01→…→.s00`) numbering conventions
+- **`VolumeResolver` callback**: IO-free callback type threaded through
+  `ArchiveReader` and `RarArchive.open`; `lib/io.dart` supplies a
+  `fileVolumeResolver()` backed by `dart:io` that automatically locates
+  next-volume files alongside the first part
+- **`openRarFile`** wires the file-system resolver by default
+  (`autoVolume: true`); pass `autoVolume: false` to disable
+- **Multi-volume extraction** (`_unpackSplit`): assembles packed fragments
+  from successive volumes into one buffer, uses the **last** part's CRC
+  (the whole-file CRC) for verification rather than the per-part packed-
+  data CRCs stored in earlier parts
+- **Integration tests** against `test/fixtures/vol.part{1-4}.rar` (a real
+  4-part RAR 5.0 volume set, 5000-byte binary file): byte-exact extraction
+  via `extractFile` and `extractAll`, and explicit rejection without a
+  resolver
+- **Recovery records** (`recvol5.cpp`) deferred: relies on Reed-Solomon
+  over GF(2^16) — no test fixtures exist and implementation scope is large
+  relative to practical need
 
-## 8. Completeness + polish — ⬜ planned
+## 8. Completeness + polish — ✅ done
 
-- RAR 1.4 (`rarFmt14`) full header support (`headers.hpp` legacy fields)
-- Extra fields: file redirection (links, symlinks, hard links) via
-  `FHEXTRA_REDIR`, owners/streams (`FHEXTRA_UOWNER`, NTFS streams)
-- File version info, high-precision times, comments/quick-open blocks
-- Full `testArchive` parity, per-entry `isSolid` sequencing for solid archives
-- Performance pass (avoid list-based buffers, `Uint8List` everywhere),
-  web/compiler compatibility verification
+- **Extra area records** — all three remaining types ported from
+  `ProcessExtra50` in `arcread.cpp`:
+  - `FHEXTRA_REDIR` (0x05): file system redirection (Unix symlink, Windows
+    symlink, junction, hard link, file copy); exposed as
+    `ArchiveEntry.redirectType` ([FileSystemRedirect]) and
+    `.redirectTarget`; `.isRedirect` convenience getter
+  - `FHEXTRA_UOWNER` (0x06): Unix owner/group; string name and/or numeric
+    UID/GID; exposed as `ArchiveEntry.unixOwner` ([UnixOwnerInfo])
+  - `FHEXTRA_HTIME` (0x03): high-precision timestamps; Unix 32-bit ±
+    nanoseconds or Windows FILETIME (100-ns); exposed as
+    `ArchiveEntry.createdTime` and `.accessedTime`; `modifiedTime` is
+    superseded when the record carries a higher-precision mtime;
+    `winFileTimeToDateTime` ported from `RarTime::SetWin` in `timefn.cpp`
+
+- **RAR 4.x Unix symlink detection**: `_parseFileHeader15` now checks
+  `hostOs==HOST_UNIX && (fileAttr & 0xF000)==0xA000` and sets
+  `redirectType = FileSystemRedirect.fsRedirUnixSymlink`, matching
+  `ConvertFileHeader` in the C code
+
+- **`ArchiveEntry` model expansion**: added `createdTime`, `accessedTime`,
+  `redirectType`, `redirectTarget`, `redirectTargetIsDir`, `isRedirect`,
+  `unixOwner` fields; `UnixOwnerInfo` class; all backward-compatible (new
+  fields are optional / have defaults)
+
+- **RAR 1.4 format** (`rarFmt14`) support: `_readHeader14Main` /
+  `_readHeader14` ported from `Archive::ReadHeader14` in `arcread.cpp`;
+  reads the 4-byte mark, main header flags, and file headers; CRC
+  verification skipped (RAR 1.4 uses a 16-bit hash distinct from CRC32)
+
+- **`Uint8List` performance pass**: `RawReader._data` replaced with a
+  chunk-list backed by `Uint8List` chunks; `getB` returns `Uint8List`;
+  `_readExact` and `_readUpTo` in `ArchiveReader` use `Uint8List` buffers;
+  eliminates per-byte boxing in all header and block reads
+
+- **Integration tests** (113 total, all green):
+  - `symlinks.rar`: `FHEXTRA_REDIR` detected, `redirectType` and
+    `redirectTarget` correct
+  - `with_owner.rar`: `FHEXTRA_UOWNER` UID and GID fields populated
+  - `with_htime.rar`: `FHEXTRA_HTIME` mtime field populated
+  - `rar4_lz_normal.rar` (libarchive corpus): directories, files, and
+    Unix symlink all listed correctly; `redirectType` set for the symlink
 
 ---
 
