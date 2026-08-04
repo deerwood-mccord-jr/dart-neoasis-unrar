@@ -113,9 +113,11 @@ void main() {
       await expectLater(reader.init(), throwsA(isA<UnrarHeaderException>()));
     });
 
-    test('RAR 4 compressed entries throw UnsupportedMethodException', () async {
-      // The synthetic archive declares method 2 / unp version 29 (RAR 3/4 LZ),
-      // which is not implemented yet, so unpacking must be rejected.
+    test('RAR 4 compressed entries route to the RAR4 decompressor', () async {
+      // The synthetic archive declares method 2 / unp version 29 (RAR 3/4 LZ)
+      // with placeholder packed data and a fake CRC. Dispatch must reach the
+      // RAR4 decompressor (which produces 100 bytes here) rather than throw
+      // UnsupportedMethodException, and the fake CRC must then be rejected.
       final reader = ArchiveReader(MemoryByteSource(_rar4Archive()));
       await reader.init();
       final entries = await reader.list();
@@ -123,7 +125,7 @@ void main() {
       expect(entries.single.unpVer, 29);
       await expectLater(
         reader.extractFile(entries.single.name),
-        throwsA(isA<UnsupportedMethodException>()),
+        throwsA(isA<UnrarException>()),
       );
     });
 

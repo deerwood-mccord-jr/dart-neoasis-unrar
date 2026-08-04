@@ -285,7 +285,7 @@ class Rar5Unpacker {
         }
       }
 
-      final mainSlot = _decodeNumber(_inp, _blockTables.ld);
+      final mainSlot = decodeNumber(_inp, _blockTables.ld);
       if (mainSlot < 256) {
         _window![_unpPtr++] = mainSlot;
         continue;
@@ -295,7 +295,7 @@ class Rar5Unpacker {
 
         var distance = 1;
         int dBits;
-        final distSlot = _decodeNumber(_inp, _blockTables.dd);
+        final distSlot = decodeNumber(_inp, _blockTables.dd);
         if (distSlot < 4) {
           dBits = 0;
           distance += distSlot;
@@ -315,7 +315,7 @@ class Rar5Unpacker {
               }
               _inp.addbits(dBits - 4);
             }
-            distance += _decodeNumber(_inp, _blockTables.ldd);
+            distance += decodeNumber(_inp, _blockTables.ldd);
             // The 32-bit "distance can be 0 for multiples of 4 GB" correction
             // does not apply to Dart's 64-bit integers.
           } else {
@@ -360,7 +360,7 @@ class Rar5Unpacker {
         }
         _oldDist[0] = distance;
 
-        final length = _slotToLength(_inp, _decodeNumber(_inp, _blockTables.rd));
+        final length = _slotToLength(_inp, decodeNumber(_inp, _blockTables.rd));
         _lastLength = length;
         _copyString(length, distance);
         continue;
@@ -426,113 +426,6 @@ class Rar5Unpacker {
       while (length-- > 0) {
         window[_unpPtr] = window[_wrapUp(srcPtr++)];
         _unpPtr = _wrapUp(_unpPtr + 1);
-      }
-    }
-  }
-
-  /// Mirrors `Unpack::DecodeNumber`.
-  int _decodeNumber(BitInput inp, DecodeTable dec) {
-    // Left aligned 15-bit raw bit field.
-    final bitField = inp.getbits() & 0xfffe;
-
-    if (bitField < dec.decodeLen[dec.quickBits]) {
-      final code = bitField >> (16 - dec.quickBits);
-      inp.addbits(dec.quickLen[code]);
-      return dec.quickNum[code];
-    }
-
-    // Detect the real bit length for the current code.
-    var bits = 15;
-    for (var i = dec.quickBits + 1; i < 15; i++) {
-      if (bitField < dec.decodeLen[i]) {
-        bits = i;
-        break;
-      }
-    }
-
-    inp.addbits(bits);
-
-    final dist = bitField - dec.decodeLen[bits - 1];
-    final shifted = dist >> (16 - bits);
-    var pos = dec.decodePos[bits] + shifted;
-
-    // Out of bounds safety check required for damaged archives. C relies on
-    // unsigned wrap-around, which appears as a negative value in Dart.
-    if (pos < 0 || pos >= dec.maxNum) {
-      pos = 0;
-    }
-
-    return dec.decodeNum[pos];
-  }
-
-  /// Mirrors `Unpack::MakeDecodeTables`.
-  void _makeDecodeTables(Uint8List lengthTable, DecodeTable dec, int size) {
-    dec.maxNum = size;
-
-    final lengthCount = Uint32List(16);
-    for (var i = 0; i < size; i++) {
-      lengthCount[lengthTable[i] & 0xf]++;
-    }
-    lengthCount[0] = 0;
-
-    for (var i = 0; i < size; i++) {
-      dec.decodeNum[i] = 0;
-    }
-    dec.decodePos[0] = 0;
-    dec.decodeLen[0] = 0;
-
-    var upperLimit = 0;
-    for (var i = 1; i < 16; i++) {
-      upperLimit += lengthCount[i];
-      final leftAligned = upperLimit << (16 - i);
-      upperLimit *= 2;
-      dec.decodeLen[i] = leftAligned;
-      dec.decodePos[i] = dec.decodePos[i - 1] + lengthCount[i - 1];
-    }
-
-    final copyDecodePos = Uint32List.fromList(dec.decodePos);
-    for (var i = 0; i < size; i++) {
-      final curBitLength = lengthTable[i] & 0xf;
-      if (curBitLength != 0) {
-        final lastPos = copyDecodePos[curBitLength];
-        dec.decodeNum[lastPos] = i;
-        copyDecodePos[curBitLength]++;
-      }
-    }
-
-    switch (size) {
-      case nc:
-        dec.quickBits = maxQuickDecodeBits;
-        break;
-      default:
-        dec.quickBits = maxQuickDecodeBits > 3 ? maxQuickDecodeBits - 3 : 0;
-    }
-
-    final quickDataSize = 1 << dec.quickBits;
-    var curBitLength = 1;
-    for (var code = 0; code < quickDataSize; code++) {
-      final bitField = code << (16 - dec.quickBits);
-
-      while (curBitLength < 16 && bitField >= dec.decodeLen[curBitLength]) {
-        curBitLength++;
-      }
-      dec.quickLen[code] = curBitLength;
-
-      // Mirrors the C guard `CurBitLength<ASIZE(DecodePos)` before indexing
-      // `DecodePos[CurBitLength]`, which is otherwise out of range when
-      // [curBitLength] reaches 16 for unusual but valid tables.
-      if (curBitLength < 16) {
-        final dist = bitField - dec.decodeLen[curBitLength - 1];
-        final shifted = dist >> (16 - curBitLength);
-        final pos = dec.decodePos[curBitLength] + shifted;
-
-        if (pos < size) {
-          dec.quickNum[code] = dec.decodeNum[pos];
-        } else {
-          dec.quickNum[code] = 0;
-        }
-      } else {
-        dec.quickNum[code] = 0;
       }
     }
   }
@@ -610,12 +503,12 @@ class Rar5Unpacker {
       }
     }
 
-    _makeDecodeTables(bitLength, tables.bd, bc);
+    makeDecodeTables(bitLength, tables.bd, bc);
 
     final table = Uint8List(huffTableSizeX);
     final tableSize = _extraDist ? huffTableSizeX : huffTableSizeB;
     for (var i = 0; i < tableSize;) {
-      final number = _decodeNumber(inp, tables.bd);
+      final number = decodeNumber(inp, tables.bd);
       if (number < 16) {
         table[i] = number;
         i++;
@@ -651,12 +544,12 @@ class Rar5Unpacker {
       }
     }
     _tablesRead5 = true;
-    _makeDecodeTables(table.sublist(0, nc), tables.ld, nc);
+    makeDecodeTables(table.sublist(0, nc), tables.ld, nc);
     final dCodes = _extraDist ? dcx : dcb;
-    _makeDecodeTables(table.sublist(nc, nc + dCodes), tables.dd, dCodes);
-    _makeDecodeTables(
+    makeDecodeTables(table.sublist(nc, nc + dCodes), tables.dd, dCodes);
+    makeDecodeTables(
         table.sublist(nc + dCodes, nc + dCodes + ldc), tables.ldd, ldc);
-    _makeDecodeTables(
+    makeDecodeTables(
         table.sublist(nc + dCodes + ldc, nc + dCodes + ldc + rc), tables.rd, rc);
     return true;
   }
@@ -922,4 +815,113 @@ void _rawPut4(int value, Uint8List data, int offset) {
   data[offset + 1] = (value >> 8) & 0xff;
   data[offset + 2] = (value >> 16) & 0xff;
   data[offset + 3] = (value >> 24) & 0xff;
+}
+
+/// Mirrors `Unpack::DecodeNumber` (shared by the RAR 4.x and RAR 5.0
+/// decompressors).
+int decodeNumber(BitInput inp, DecodeTable dec) {
+  // Left aligned 15-bit raw bit field.
+  final bitField = inp.getbits() & 0xfffe;
+
+  if (bitField < dec.decodeLen[dec.quickBits]) {
+    final code = bitField >> (16 - dec.quickBits);
+    inp.addbits(dec.quickLen[code]);
+    return dec.quickNum[code];
+  }
+
+  // Detect the real bit length for the current code.
+  var bits = 15;
+  for (var i = dec.quickBits + 1; i < 15; i++) {
+    if (bitField < dec.decodeLen[i]) {
+      bits = i;
+      break;
+    }
+  }
+
+  inp.addbits(bits);
+
+  final dist = bitField - dec.decodeLen[bits - 1];
+  final shifted = dist >> (16 - bits);
+  var pos = dec.decodePos[bits] + shifted;
+
+  // Out of bounds safety check required for damaged archives. C relies on
+  // unsigned wrap-around, which appears as a negative value in Dart.
+  if (pos < 0 || pos >= dec.maxNum) {
+    pos = 0;
+  }
+
+  return dec.decodeNum[pos];
+}
+
+/// Mirrors `Unpack::MakeDecodeTables` (shared by the RAR 4.x and RAR 5.0
+/// decompressors).
+void makeDecodeTables(Uint8List lengthTable, DecodeTable dec, int size) {
+  dec.maxNum = size;
+
+  final lengthCount = Uint32List(16);
+  for (var i = 0; i < size; i++) {
+    lengthCount[lengthTable[i] & 0xf]++;
+  }
+  lengthCount[0] = 0;
+
+  for (var i = 0; i < size; i++) {
+    dec.decodeNum[i] = 0;
+  }
+  dec.decodePos[0] = 0;
+  dec.decodeLen[0] = 0;
+
+  var upperLimit = 0;
+  for (var i = 1; i < 16; i++) {
+    upperLimit += lengthCount[i];
+    final leftAligned = upperLimit << (16 - i);
+    upperLimit *= 2;
+    dec.decodeLen[i] = leftAligned;
+    dec.decodePos[i] = dec.decodePos[i - 1] + lengthCount[i - 1];
+  }
+
+  final copyDecodePos = Uint32List.fromList(dec.decodePos);
+  for (var i = 0; i < size; i++) {
+    final curBitLength = lengthTable[i] & 0xf;
+    if (curBitLength != 0) {
+      final lastPos = copyDecodePos[curBitLength];
+      dec.decodeNum[lastPos] = i;
+      copyDecodePos[curBitLength]++;
+    }
+  }
+
+  switch (size) {
+    case nc:
+      dec.quickBits = maxQuickDecodeBits;
+      break;
+    default:
+      dec.quickBits = maxQuickDecodeBits > 3 ? maxQuickDecodeBits - 3 : 0;
+  }
+
+  final quickDataSize = 1 << dec.quickBits;
+  var curBitLength = 1;
+  for (var code = 0; code < quickDataSize; code++) {
+    final bitField = code << (16 - dec.quickBits);
+
+    while (curBitLength < 16 && bitField >= dec.decodeLen[curBitLength]) {
+      curBitLength++;
+    }
+    dec.quickLen[code] = curBitLength;
+
+    // Mirrors the C guard `CurBitLength<ASIZE(DecodePos)` before indexing
+    // `DecodePos[CurBitLength]`, which is otherwise out of range when
+    // [curBitLength] reaches 16 for unusual but valid tables.
+    if (curBitLength < 16) {
+      final dist = bitField - dec.decodeLen[curBitLength - 1];
+      final shifted = dist >> (16 - curBitLength);
+      final pos = dec.decodePos[curBitLength] + shifted;
+
+      if (pos < size) {
+        dec.quickNum[code] = dec.decodeNum[pos];
+      } else {
+        dec.quickNum[code] = 0;
+      }
+    } else {
+      dec.quickNum[code] = 0;
+    }
+  }
 }

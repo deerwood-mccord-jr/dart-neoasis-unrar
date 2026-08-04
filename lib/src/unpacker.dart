@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'byte_source.dart';
 import 'crc.dart';
 import 'header_constants.dart';
+import 'unpack4.dart';
 import 'unpack5.dart';
 import 'unrar_error.dart';
 
@@ -26,10 +27,10 @@ class UnsupportedMethodException extends UnrarException {
 /// Decompresses a single entry's packed data stream, ported from the C
 /// `Unpack` class (`unpack.cpp`).
 ///
-/// Method 0 (stored) and the RAR 5.0/7.0 decompressor ([Rar5Unpacker]) are
-/// implemented. The RAR 4.x (LZSS/PPMd) decompressors are a future
-/// milestone; [Unpacker.unpack] throws [UnsupportedMethodException] for
-/// anything else.
+/// Method 0 (stored), the RAR 5.0/7.0 decompressor ([Rar5Unpacker]) and the
+/// RAR 4.x decompressor ([Rar4Unpacker], unpVer 20/26/29) are implemented.
+/// RAR 1.5 (unpVer 15) is not; [Unpacker.unpack] throws
+/// [UnsupportedMethodException] for it.
 class Unpacker {
   Unpacker(this._source);
 
@@ -39,6 +40,9 @@ class Unpacker {
   /// carry across the files of a solid stream. Recreated never; each entry
   /// passes its own `solid` flag to control state reuse.
   Rar5Unpacker? _rar5;
+
+  /// Persistent RAR 4.x decompressor, reused across a solid stream.
+  Rar4Unpacker? _rar4;
 
   /// Unpacks the file whose packed data starts at [dataOffset] in [ByteSource]
   /// and returns the unpacked bytes.
@@ -65,6 +69,10 @@ class Unpacker {
     }
     if (unpVer == verPack5 || unpVer == verPack7) {
       return _unpack5(packSize, unpSize, unknownUnpSize, dataOffset,
+          expectedCrc, windowSize, solid, unpVer);
+    }
+    if (unpVer == 20 || unpVer == 26 || unpVer == 29) {
+      return _unpack4(packSize, unpSize, unknownUnpSize, dataOffset,
           expectedCrc, windowSize, solid, unpVer);
     }
     throw UnsupportedMethodException(method, packSize, unpSize);
@@ -116,6 +124,39 @@ class Unpacker {
       windowSize: windowSize,
       solid: solid,
       extraDist: unpVer == verPack7,
+    );
+
+    if (expectedCrc != 0) {
+      final actualCrc = crc32Of(out);
+      if (actualCrc != expectedCrc) {
+        throw UnrarException(
+            'CRC32 mismatch for compressed entry (expected '
+            '$expectedCrc, got $actualCrc)');
+      }
+    }
+    return out;
+  }
+
+  /// RAR 4.x compressed entry (unpVer 20/26/29).
+  Future<Uint8List> _unpack4(
+    int packSize,
+    int unpSize,
+    bool unknownUnpSize,
+    int dataOffset,
+    int expectedCrc,
+    int windowSize,
+    bool solid,
+    int unpVer,
+  ) async {
+    await _source.seek(dataOffset);
+    final packed = await _readUpTo(packSize);
+    final rar4 = _rar4 ??= Rar4Unpacker();
+    final out = rar4.unpack4(
+      packed: packed,
+      unpSize: unpSize,
+      windowSize: windowSize,
+      solid: solid,
+      unpVer: unpVer,
     );
 
     if (expectedCrc != 0) {

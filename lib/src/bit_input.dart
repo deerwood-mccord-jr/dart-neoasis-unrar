@@ -54,6 +54,19 @@ class BitInput {
     _inBit = bits & 7;
   }
 
+  /// Reads one whole byte from the current position, matching the C
+  /// `Unpack::GetChar()` byte-wise reader used by the PPMd range coder.
+  ///
+  /// Like the C code, once the (padded) buffer is exhausted it returns 0
+  /// forever instead of reading past the end, so a truncated PPM stream
+  /// terminates instead of throwing.
+  int getChar() {
+    if (_inAddr >= _buffer.length) {
+      return 0;
+    }
+    return _buffer[_inAddr++];
+  }
+
   /// Returns 16 bits from the current position, matching `getbits()`.
   /// The bit at (`_inAddr`, `_inBit`) has the highest position.
   int getbits() {
