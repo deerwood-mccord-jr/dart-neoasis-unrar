@@ -192,7 +192,7 @@ surface.
   - All 90 previous tests still pass (crypto vectors, format reading, RAR
     4.x / RAR 5.0 / RAR 7.0 compressed extraction, volumes)
 
-## 7. Volumes + recovery + integrity — ✅ done
+## 7. Volumes + recovery + integrity — ✅ done (commit `815581c`)
 
 - **`NextVolumeName` algorithm** (`pathfn.cpp`): pure string port; handles
   new-style (`part1→part2`, digit-carry with insert) and old-style
@@ -215,7 +215,7 @@ surface.
   over GF(2^16) — no test fixtures exist and implementation scope is large
   relative to practical need
 
-## 8. Completeness + polish — ✅ done
+## 8. Completeness + polish — ✅ done (commit `815581c`)
 
 - **Extra area records** — all three remaining types ported from
   `ProcessExtra50` in `arcread.cpp`:
