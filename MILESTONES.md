@@ -117,7 +117,7 @@ Two families, versioned by `UnpVer`.
   worse than an explicit error; `Unpacker.unpack` keeps throwing
   `UnsupportedMethodException` for unpVer 15
 
-## 6. Encryption — ✅ done
+## 6. Encryption — ✅ done (commit `48eccae`)
 
 Pure Dart AES + PBKDF2 crypto, data decryption for both archive formats, and
 header decryption (`-hp`), with a password API threaded through the public
