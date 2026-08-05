@@ -215,6 +215,38 @@ surface.
   over GF(2^16) — no test fixtures exist and implementation scope is large
   relative to practical need
 
+### 7b. REV recovery-volume reconstruction — ✅ done
+
+Ported `RecVolumes5` (`recvol5.cpp`) + `RSCoder16` (`rs16.cpp`) so missing or
+corrupt RAR 5.0 volumes can be rebuilt from `*.rev` files:
+
+- **`Rs16`** (`lib/src/rs16.dart`): GF(2^16) tables (poly `0x1100B`),
+  Cauchy encoder matrix (`C(R,j) = inv(R ^ j)`, `^` = XOR), Gauss-Jordan
+  decoder-matrix inversion with the C's copy-back step. One caveat: the log
+  table must be 32-bit wide — `gfLog[0] = 2*gfSize` (131070) overflows a
+  `Uint16List` (truncates to 65534) and silently corrupts products with zero,
+  which Python's big ints masked during validation
+- **REV5 header parsing** (`lib/src/recvol.dart`): `readRevHeader`
+  validates signature/`BlockCRC`, exposes `dataCount`, `recCount`, the
+  absolute `recNum`, per-volume `RevVolumeInfo` (size + CRC32) and the ECC
+  data offset
+- **`restoreVolumes`**: byte-source-based core that CRC-validates every
+  surviving volume, treats corrupt ones as missing, streams recovered chunks
+  through a `RecoveredVolumeWriter` callback, and reports which indices were
+  rebuilt. Round-verified against real RAR 7.23 fixtures (`rar a -v100k
+  -rv5`): one-erasure, two-erasure, odd-size-last-volume, and corrupt-in-
+  place repairs all byte-exact
+- **`restoreRevArchive`** (`lib/io.dart`): enumerates sibling volumes on
+  disk, generates canonical `partN` names, and writes rebuilt volumes
+  (optionally to a separate `outputDir`)
+- **Tests** (`test/rev_restore_test.dart`): fixture set checked into
+  `test/fixtures/rev/` (3 data + 5 recovery volumes). Header parsing,
+  byte-for-byte ECC re-encode, restore of 1/2 missing, odd-size, corrupt-
+  treated-as-missing, too-many-missing, mismatched-set, and end-to-end disk
+  restore incl. `outputDir`
+- **Scope**: standalone `.rev` files only (as UnRAR). RAR 4.x `recvol3.cpp`
+  not ported (RAR 7 can't create those).
+
 ## 8. Completeness + polish — ✅ done (commit `815581c`)
 
 - **Extra area records** — all three remaining types ported from

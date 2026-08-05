@@ -59,6 +59,55 @@ int _getVolNumPos(String name, int nameStart) {
 
 bool _isDigit(String c) => c.codeUnitAt(0) >= 0x30 && c.codeUnitAt(0) <= 0x39;
 
+/// Parses the 1-based volume number from [name]'s final numeric run,
+/// mirroring the digit walk in `recvol5.cpp`.
+///
+/// Returns 0 when the name has no numeric run (or the run lies entirely in
+/// the directory component), e.g. `arc.part12.rar` → 12, `arc.part01.rar` → 1.
+int getVolumeNumber(String name, {int nameStart = 0}) {
+  final pos = _getVolNumPos(name, nameStart);
+  if (pos >= name.length || !_isDigit(name[pos])) return 0;
+  var num = 0;
+  var k = 1;
+  var p = pos;
+  while (p >= nameStart && _isDigit(name[p])) {
+    num += (name.codeUnitAt(p) - 0x30) * k;
+    k *= 10;
+    p--;
+  }
+  return num;
+}
+
+/// Converts [name] to the first-volume form, mirroring
+/// `VolNameToFirstName` (new numbering): the volume number run is replaced by
+/// `1` followed by zeros, preserving width (`arc.part007.rar` →
+/// `arc.part001.rar`).
+String firstVolumeName(String name, {int nameStart = 0}) {
+  final pos = _getVolNumPos(name, nameStart);
+  if (pos >= name.length || !_isDigit(name[pos])) return name;
+  final chars = name.split('');
+  var n = '1';
+  var p = pos;
+  while (p >= nameStart && _isDigit(name[p])) {
+    chars[p] = n;
+    n = '0';
+    p--;
+  }
+  return chars.join();
+}
+
+/// Position of the first digit of [name]'s final numeric run, or `-1` when
+/// the name has no such run. Mirrors the `NumPos` walk in `recvol5.cpp`.
+int volumeNumberStart(String name, {int nameStart = 0}) {
+  final pos = _getVolNumPos(name, nameStart);
+  if (pos >= name.length || !_isDigit(name[pos])) return -1;
+  var p = pos;
+  while (p > nameStart && _isDigit(name[p - 1])) {
+    p--;
+  }
+  return p;
+}
+
 /// Computes the name of the next volume in a multi-part archive set,
 /// mirroring `NextVolumeName` from `pathfn.cpp`.
 ///

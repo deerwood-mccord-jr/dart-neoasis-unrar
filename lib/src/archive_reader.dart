@@ -687,6 +687,8 @@ class ArchiveReader {
         _info.encrypted = (head.flags & mhdPassword) != 0;
         _info.firstVolume = (head.flags & mhdFirstVolume) != 0;
         _info.newNumbering = (head.flags & mhdNewNumbering) != 0;
+        _info.comment = (head.flags & mhdComment) != 0;
+        _info.signed = _info.posAv != 0 || _info.highPosAv != 0;
         _encrypted = _info.encrypted;
         break;
       case HeaderType.headFile:
@@ -755,6 +757,11 @@ class ArchiveReader {
     final name = _decodeName15(rawName, head.flags);
 
     if (isService) {
+      // A "CMT" sub-header marks the archive as having a comment
+      // (matching `MainComment` in `arcread.cpp`).
+      if (name.toUpperCase() == 'CMT') {
+        _info.comment = true;
+      }
       // Skip any remaining extra data and return null.
       if ((head.flags & lhdSalt) != 0) {
         raw.skip(sizeSalt30);
@@ -1054,6 +1061,7 @@ class ArchiveReader {
     _info.solid = (arcFlags & mhflSolid) != 0;
     _info.locked = (arcFlags & mhflLock) != 0;
     _info.protected = (arcFlags & mhflProtect) != 0;
+    _info.signed = false; // RAR 5.0 never reports a signature (arcread.cpp).
     _info.newNumbering = true;
     if ((arcFlags & mhflVolNumber) != 0) {
       _info.volNumber = raw.getV();
@@ -1107,6 +1115,10 @@ class ArchiveReader {
     final name = utf8.decode(slice, allowMalformed: true);
 
     if (isService) {
+      // A "CMT" sub-header marks the archive as having a comment.
+      if (name.toUpperCase() == 'CMT') {
+        _info.comment = true;
+      }
       return null;
     }
 

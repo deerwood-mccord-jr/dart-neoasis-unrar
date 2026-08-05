@@ -44,13 +44,18 @@ Implemented (ported and unit-tested):
   - RAR 4.x Unix symlink auto-detection from `fileAttr & 0xF000`
   - RAR 1.4 archive format (`rarFmt14`) header reading
   - `Uint8List` performance pass throughout all hot paths
+- **REV recovery-volume reconstruction (7b)**: RAR 5.0 `*.rev` header parsing
+  + Reed-Solomon over GF(2^16) (`recvol5.cpp`, `rs16.cpp`) — `restoreVolumes`
+  (byte-source core) and `restoreRevArchive` (disk helper) rebuild missing or
+  corrupt volumes, verified byte-exact against real RAR 7.23 fixtures
 - **BLAKE2sp file hashes (M9)**: port of the BLAKE2s/2sp tree hash used by
   RAR 5.0 (`-htb` archives) (`blake2s.cpp`, `blake2sp.cpp`) — `FHEXTRA_HASH`
   parsing → `hashType` + `blake2Digest` on `ArchiveEntry`; digest verification
   after extraction (plain digest, or HMAC-SHA256 MAC for encrypted entries)
 
 Not yet implemented:
-- Recovery record reconstruction (`recvol5.cpp` Reed-Solomon over GF(2^16))
+- RAR 4.x recovery records (`recvol3.cpp`); RAR 7 can only create RAR 5.0
+  `.rev` files
 - Multi-volume splicing of encrypted split entries is supported but the
   volume-resolver callback must open encrypted volumes with the same password
 - NTFS alternate data streams (`FHEXTRA_SUBDATA`)

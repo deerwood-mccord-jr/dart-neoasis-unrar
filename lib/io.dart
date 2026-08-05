@@ -92,3 +92,116 @@ Future<RarArchive> openRarFile(
   );
 }
 
+/// Rebuilds missing RAR 5.0 volumes using `*.rev` recovery volumes.
+///
+/// [archiveName] names any volume of the set (e.g. `arc.part1.rar` or
+/// `arc.part1.rev`). The directory containing it is scanned for sibling
+/// `*.partN.rar` and `*.partN.rev` files sharing the same name prefix; the
+/// recovery volumes' headers identify the volume sizes and CRCs, and the
+/// surviving volumes are checked against them.
+///
+/// Rebuilt volumes are written to [outputDir] (defaults to the directory
+/// containing the volumes, overwriting corrupt volumes in place) under their
+/// canonical `partN` names. Returns the paths of the rebuilt volumes.
+///
+/// Throws [UnrarException] when no valid recovery volume is found, the set is
+/// inconsistent, or more volumes are missing than can be repaired.
+Future<List<String>> restoreRevArchive(
+  String archiveName, {
+  String? outputDir,
+  int chunkSize = 1 << 20,
+}) async {
+  final dirPath = File(archiveName).parent.path;
+  final slash = archiveName.lastIndexOf('/');
+  final backslash = archiveName.lastIndexOf('\\');
+  final nameStart = (slash > backslash ? slash : backslash) + 1;
+  final baseName = archiveName.substring(nameStart);
+
+  final prefixEnd = volumeNumberStart(baseName);
+  if (prefixEnd < 0) {
+    throw const UnrarException('Volume name has no numeric part');
+  }
+  final prefix = baseName.substring(0, prefixEnd);
+  final outDir = outputDir ?? dirPath;
+  await Directory(outDir).create(recursive: true);
+
+  final rarNames = <int, String>{};
+  final revPaths = <String>[];
+  await for (final entity in Directory(dirPath).list()) {
+    if (entity is! File) continue;
+    final name = entity.uri.pathSegments.last;
+    if (!name.startsWith(prefix)) continue;
+    if (name.toLowerCase().endsWith('.rar')) {
+      final num = getVolumeNumber(name);
+      if (num > 0) rarNames[num - 1] = entity.path;
+    } else if (name.toLowerCase().endsWith('.rev')) {
+      revPaths.add(entity.path);
+    }
+  }
+
+  final revVolumes = <RevVolume>[];
+  for (final path in revPaths) {
+    final source = FileByteSource(File(path));
+    try {
+      final header = await readRevHeader(source);
+      if (header == null) {
+        await source.close();
+        continue;
+      }
+      revVolumes.add(RevVolume(header: header, source: source));
+    } catch (_) {
+      await source.close();
+    }
+  }
+  if (revVolumes.isEmpty) {
+    throw const UnrarException('No valid recovery volumes found');
+  }
+
+  final nd = revVolumes[0].header.dataCount;
+  final dataVolumes = List<ByteSource?>.filled(nd, null);
+  for (final entry in rarNames.entries) {
+    if (entry.key >= nd) continue;
+    final source = FileByteSource(File(entry.value));
+    try {
+      await source.seek(0);
+      dataVolumes[entry.key] = source;
+    } catch (_) {
+      await source.close();
+    }
+  }
+
+  final base = firstVolumeName(baseName);
+  final names = List<String>.generate(nd, (i) {
+    var name = base;
+    for (var k = 0; k < i; k++) {
+      name = nextVolumeName(name);
+    }
+    return name;
+  });
+
+  final outFiles = <int, RandomAccessFile>{};
+  try {
+    final recovered = await restoreVolumes(
+      dataVolumes: dataVolumes,
+      revVolumes: revVolumes,
+      chunkSize: chunkSize,
+      writeChunk: (index, data, length) async {
+        final raf = outFiles[index] ??=
+            await File('$outDir/${names[index]}').open(mode: FileMode.write);
+        await raf.writeFrom(data, 0, length);
+      },
+    );
+    return [for (final index in recovered) '$outDir/${names[index]}'];
+  } finally {
+    for (final raf in outFiles.values) {
+      await raf.close();
+    }
+    for (final source in dataVolumes) {
+      await source?.close();
+    }
+    for (final rev in revVolumes) {
+      await rev.source.close();
+    }
+  }
+}
+

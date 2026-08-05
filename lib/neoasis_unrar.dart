@@ -13,9 +13,23 @@ export 'src/archive_entry.dart';
 export 'src/archive_info.dart';
 export 'src/byte_source.dart';
 export 'src/header_constants.dart';
+export 'src/recvol.dart'
+    show
+        RevHeader,
+        RevVolume,
+        RevVolumeInfo,
+        RecoveredVolumeWriter,
+        readRevHeader,
+        restoreVolumes;
 export 'src/unpacker.dart';
 export 'src/unrar_error.dart';
-export 'src/volume.dart' show VolumeResolver, nextVolumeName;
+export 'src/volume.dart'
+    show
+        VolumeResolver,
+        nextVolumeName,
+        getVolumeNumber,
+        firstVolumeName,
+        volumeNumberStart;
 
 import 'src/archive_entry.dart';
 import 'src/archive_info.dart';
