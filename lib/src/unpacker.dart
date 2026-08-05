@@ -2,9 +2,11 @@ import 'dart:typed_data';
 
 import 'aes.dart';
 import 'archive_entry.dart';
+import 'blake2s.dart';
 import 'byte_source.dart';
 import 'crc.dart';
 import 'header_constants.dart';
+import 'hmac.dart';
 import 'kdf3.dart';
 import 'kdf5.dart';
 import 'unpack4.dart';
@@ -71,6 +73,8 @@ class Unpacker {
     String? password,
     CryptInfo? cryptInfo,
     bool alreadyDecrypted = false,
+    FileHashType hashType = FileHashType.none,
+    List<int>? blake2Digest,
   }) async {
     Uint8List packed = data;
     if (!alreadyDecrypted && cryptInfo != null && password != null) {
@@ -91,6 +95,7 @@ class Unpacker {
               '(expected $expectedCrc, got $actualCrc)');
         }
       }
+      _verifyFileHash(out, hashType, blake2Digest, cryptInfo, password);
       return out;
     }
 
@@ -113,6 +118,7 @@ class Unpacker {
               '(expected $expectedCrc, got $actualCrc)');
         }
       }
+      _verifyFileHash(out, hashType, blake2Digest, cryptInfo, password);
       return out;
     }
 
@@ -133,6 +139,7 @@ class Unpacker {
               '(expected $expectedCrc, got $actualCrc)');
         }
       }
+      _verifyFileHash(out, hashType, blake2Digest, cryptInfo, password);
       return out;
     }
 
@@ -157,20 +164,25 @@ class Unpacker {
     bool solid = false,
     String? password,
     CryptInfo? cryptInfo,
+    FileHashType hashType = FileHashType.none,
+    List<int>? blake2Digest,
   }) async {
     if (method == 0) {
       return _store(packSize, unpSize, unknownUnpSize, dataOffset, expectedCrc,
-          password: password, cryptInfo: cryptInfo);
+          password: password, cryptInfo: cryptInfo,
+          hashType: hashType, blake2Digest: blake2Digest);
     }
     if (unpVer == verPack5 || unpVer == verPack7) {
       return _unpack5(packSize, unpSize, unknownUnpSize, dataOffset,
           expectedCrc, windowSize, solid, unpVer,
-          password: password, cryptInfo: cryptInfo);
+          password: password, cryptInfo: cryptInfo,
+          hashType: hashType, blake2Digest: blake2Digest);
     }
     if (unpVer == 20 || unpVer == 26 || unpVer == 29) {
       return _unpack4(packSize, unpSize, unknownUnpSize, dataOffset,
           expectedCrc, windowSize, solid, unpVer,
-          password: password, cryptInfo: cryptInfo);
+          password: password, cryptInfo: cryptInfo,
+          hashType: hashType, blake2Digest: blake2Digest);
     }
     throw UnsupportedMethodException(method, packSize, unpSize);
   }
@@ -240,6 +252,9 @@ class Unpacker {
     if (!cryptInfo.useHashKey) {
       return; // Plain CRC32 — handled by the regular check.
     }
+    if (storedMac == 0) {
+      return; // No CRC stored (RAR 5: FHFL_CRC32 flag absent); nothing to verify.
+    }
     final kdf = kdf5(password, cryptInfo.salt, cryptInfo.lg2Count);
     final actualCrc = crc32Of(plain);
     final rawCrc = [
@@ -256,6 +271,40 @@ class Unpacker {
     }
   }
 
+  /// Verifies the stored BLAKE2sp digest of the unpacked data when the entry
+  /// carries a `FHEXTRA_HASH` record.
+  ///
+  /// For encrypted RAR 5.0 entries with HMAC ([CryptInfo.useHashKey]) the
+  /// stored 32 bytes are `hmacSha256(hashKey, blake2sp(plaintext))` (see
+  /// `ConvertHashToMAC` in `crypt5.cpp`); otherwise they are the plain digest.
+  void _verifyFileHash(Uint8List plain, FileHashType hashType,
+      List<int>? blake2Digest, CryptInfo? cryptInfo, String? password) {
+    if (hashType != FileHashType.blake2 || blake2Digest == null) {
+      return;
+    }
+    final digest = Blake2Sp.digest(plain);
+    final expected = blake2Digest;
+    if (cryptInfo != null && password != null && cryptInfo.useHashKey) {
+      final kdf = kdf5(password, cryptInfo.salt, cryptInfo.lg2Count);
+      final mac = hmacSha256(kdf.hashKey, digest);
+      if (!_bytesEqual(mac, expected)) {
+        throw UnrarException(
+            'BLAKE2 MAC mismatch for encrypted entry '
+            '(wrong password or corrupt data)');
+      }
+    } else if (!_bytesEqual(digest, expected)) {
+      throw UnrarException('BLAKE2 digest mismatch for entry');
+    }
+  }
+
+  static bool _bytesEqual(List<int> a, List<int> b) {
+    if (a.length != b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
   /// Method 0: the packed data is stored verbatim (matching
   /// `CmdExtract::UnstoreFile`), capped at the unpacked size.
   Future<Uint8List> _store(
@@ -266,6 +315,8 @@ class Unpacker {
     int expectedCrc, {
     String? password,
     CryptInfo? cryptInfo,
+    FileHashType hashType = FileHashType.none,
+    List<int>? blake2Digest,
   }) async {
     await _source.seek(dataOffset);
     var packed = await _readUpTo(packSize);
@@ -286,6 +337,7 @@ class Unpacker {
             '$expectedCrc, got $actualCrc)');
       }
     }
+    _verifyFileHash(out, hashType, blake2Digest, cryptInfo, password);
     return out;
   }
 
@@ -301,6 +353,8 @@ class Unpacker {
     int unpVer, {
     String? password,
     CryptInfo? cryptInfo,
+    FileHashType hashType = FileHashType.none,
+    List<int>? blake2Digest,
   }) async {
     await _source.seek(dataOffset);
     var packed = await _readUpTo(packSize);
@@ -326,6 +380,7 @@ class Unpacker {
             '$expectedCrc, got $actualCrc)');
       }
     }
+    _verifyFileHash(out, hashType, blake2Digest, cryptInfo, password);
     return out;
   }
 
@@ -341,6 +396,8 @@ class Unpacker {
     int unpVer, {
     String? password,
     CryptInfo? cryptInfo,
+    FileHashType hashType = FileHashType.none,
+    List<int>? blake2Digest,
   }) async {
     await _source.seek(dataOffset);
     var packed = await _readUpTo(packSize);
@@ -364,6 +421,7 @@ class Unpacker {
             '$expectedCrc, got $actualCrc)');
       }
     }
+    _verifyFileHash(out, hashType, blake2Digest, cryptInfo, password);
     return out;
   }
 

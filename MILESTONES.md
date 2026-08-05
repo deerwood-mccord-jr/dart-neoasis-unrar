@@ -259,6 +259,45 @@ surface.
   - `rar4_lz_normal.rar` (libarchive corpus): directories, files, and
     Unix symlink all listed correctly; `redirectType` set for the symlink
 
+## 9. BLAKE2sp file hashes — ✅ done (commit `TBD`)
+
+Port the BLAKE2s/2sp tree hash used by RAR 5.0 `-htb` archives and verify
+stored digests after extraction.
+
+- **`blake2s.dart`** (`blake2s.cpp`, `blake2sp.cpp`): BLAKE2s core (`_g`,
+  `_compress`, `_incrementCounter`, `_finalize` with last-block flagging) and
+  the BLAKE2sp parallel-tree wrapper with fanout 8 / depth 2, node-depth and
+  node-offset parameterisation, 512-byte round feeding, tail distribution to
+  leaves, and root mixing (`InitHashState`-style parameter blocks from
+  `hash.cpp`)
+- **`FHEXTRA_HASH` parsing**: `_processExtra50` now reads the hash record
+  (type vint + digest) for `FHEXTRA_HASH_BLAKE2` (0x00), mirroring
+  `arcread.cpp ProcessExtra50`
+- **`ArchiveEntry` model expansion**: `FileHashType` enum (`none`/`blake2`)
+  exposed as `hashType`, plus `blake2Digest` (32 bytes)
+- **Verification wiring** in `Unpacker`: after extraction, the plaintext is
+  hashed with `Blake2Sp` and compared to the stored digest. For encrypted
+  RAR 5.0 entries (`FHEXTRA_CRYPT_HASHMAC`) the stored 32 bytes are
+  `hmacSha256(hashKey, digest)` per `ConvertHashToMAC` (`crypt5.cpp`); the
+  HMAC is recomputed with the KDF-derived hash key. CRC MAC verification
+  now skips entries whose `FHFL_CRC32` flag is absent (CRC 0). Wired through
+  `unpack`, `unpackFromBuffer`, `_store`, `_unpack5`, `_unpack4`, and the
+  multi-volume split path
+- **Unit tests** (`test/blake2s_test.dart`): empty-hash vector from
+  `HashValue::Init`, single-block and multi-block digests matching `rar -htb`
+  output (`fox.txt`, `blob.bin`), and incremental chunking equivalence
+  (1/2/63/64/65/127/128/512/1000) — the last caught and fixed a missing
+  zero-pad in `_finalize`'s partial-block path
+- **Integration tests** (123 total, all green):
+  - `blake2.rar` (created with `rar a -htb`): entries report
+    `hashType=blake2` + 32-byte digests; `extractAll` is byte-exact against
+    `test/fixtures/blake2_ref/{fox.txt,blob.bin}`; stored digest equals
+    `Blake2Sp(reference)`
+  - `blake2_enc.rar` (`-htb -ptestpass`): encrypted entries verify via the
+    BLAKE2 MAC; byte-exact with the correct password, `UnrarException` with a
+    wrong one
+  - archives created without `-htb` expose `hashType=none` / `null` digest
+
 ---
 
 ## Cross-cutting notes

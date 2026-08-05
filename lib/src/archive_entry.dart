@@ -42,6 +42,15 @@ class CryptInfo {
   final bool useHashKey;
 }
 
+/// Hash algorithm used for a file's `FHEXTRA_HASH` record (RAR 5.0).
+enum FileHashType {
+  /// No hash record present.
+  none,
+
+  /// 32-byte BLAKE2sp digest of the unpacked file data.
+  blake2;
+}
+
 /// Unix owner and group information from `FHEXTRA_UOWNER`, mirroring
 /// `FileHeader::UnixOwnerSet` / `UnixOwnerName` / `UnixGroupName` from
 /// `headers.hpp`.
@@ -96,6 +105,8 @@ class ArchiveEntry {
     this.redirectTarget,
     this.redirectTargetIsDir = false,
     this.unixOwner,
+    this.hashType = FileHashType.none,
+    this.blake2Digest,
   });
 
   /// Full path of the entry inside the archive.
@@ -180,6 +191,16 @@ class ArchiveEntry {
 
   /// Unix owner/group information from `FHEXTRA_UOWNER`; `null` if absent.
   final UnixOwnerInfo? unixOwner;
+
+  /// Hash algorithm stored in this entry's `FHEXTRA_HASH` record;
+  /// [FileHashType.none] when the archive does not store a hash.
+  final FileHashType hashType;
+
+  /// Stored BLAKE2sp digest of the unpacked file data (32 bytes) when
+  /// [hashType] is [FileHashType.blake2], otherwise `null`. For encrypted
+  /// files this is the HMAC-SHA256-encrypted MAC of the digest
+  /// (`hmacSha256(hashKey, digest)`).
+  final List<int>? blake2Digest;
 
   @override
   String toString() =>

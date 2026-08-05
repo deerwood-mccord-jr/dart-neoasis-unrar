@@ -8,7 +8,7 @@ in any Dart environment, including Flutter on all platforms and the web.
 
 ## Status
 
-**All eight milestones complete.** The library is a full-featured pure Dart
+**All nine milestones complete.** The library is a full-featured pure Dart
 RAR reader with no `dart:io` dependency in its core. See
 [MILESTONES.md](MILESTONES.md) for the complete milestone log.
 
@@ -44,6 +44,10 @@ Implemented (ported and unit-tested):
   - RAR 4.x Unix symlink auto-detection from `fileAttr & 0xF000`
   - RAR 1.4 archive format (`rarFmt14`) header reading
   - `Uint8List` performance pass throughout all hot paths
+- **BLAKE2sp file hashes (M9)**: port of the BLAKE2s/2sp tree hash used by
+  RAR 5.0 (`-htb` archives) (`blake2s.cpp`, `blake2sp.cpp`) — `FHEXTRA_HASH`
+  parsing → `hashType` + `blake2Digest` on `ArchiveEntry`; digest verification
+  after extraction (plain digest, or HMAC-SHA256 MAC for encrypted entries)
 
 Not yet implemented:
 - Recovery record reconstruction (`recvol5.cpp` Reed-Solomon over GF(2^16))
@@ -82,6 +86,9 @@ void main() async {
   // with CRC/MAC verification.
   await archive.extractAll((entry, data) {
     print('extracted ${entry.name}: ${data.length} bytes');
+    if (entry.hashType == FileHashType.blake2) {
+      print('  BLAKE2 verified: ${entry.blake2Digest}');
+    }
   });
 
   await archive.close();

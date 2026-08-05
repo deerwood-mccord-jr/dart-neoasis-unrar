@@ -95,6 +95,9 @@ const int fhExtraRedir = 0x05; // File system redirection.
 const int fhExtraUowner = 0x06; // Unix owner and group information.
 const int fhExtraSubdata = 0x07; // Service header subdata array.
 
+// RAR 5.0 hash type values for FHEXTRA_HASH.
+const int fhExtraHashBlake2 = 0x00; // 32-byte BLAKE2sp digest.
+
 // RAR 5.0 file compression info flags.
 const int fciSolid = 0x00000040;
 const int fciRar5Compat = 0x00100000;

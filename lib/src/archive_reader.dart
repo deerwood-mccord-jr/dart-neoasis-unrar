@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'aes.dart';
 import 'archive_entry.dart';
 import 'archive_info.dart';
+import 'blake2s.dart';
 import 'byte_source.dart';
 import 'enc_name.dart';
 import 'header_constants.dart';
@@ -362,6 +363,8 @@ class ArchiveReader {
       solid: entry.isSolid,
       password: _password,
       cryptInfo: entry.cryptInfo,
+      hashType: entry.hashType,
+      blake2Digest: entry.blake2Digest,
     );
   }
 
@@ -474,6 +477,8 @@ class ArchiveReader {
       password: pwd,
       cryptInfo: cryptInfo,
       alreadyDecrypted: true,
+      hashType: firstEntry.hashType,
+      blake2Digest: firstEntry.blake2Digest,
     );
   }
 
@@ -1151,6 +1156,8 @@ class ArchiveReader {
       redirectTarget: extra50?.redirectTarget,
       redirectTargetIsDir: extra50?.redirectTargetIsDir ?? false,
       unixOwner: extra50?.unixOwner,
+      hashType: extra50?.hashType ?? FileHashType.none,
+      blake2Digest: extra50?.blake2Digest,
     );
   }
 
@@ -1181,6 +1188,9 @@ class ArchiveReader {
         case fhExtraCrypt:
           final crypt = _parseFhExtraCrypt(raw, nextPos);
           if (crypt != null) result = result.withCrypt(crypt);
+        case fhExtraHash:
+          final hash = _parseFhExtraHash(raw, nextPos);
+          if (hash != null) result = result.withHash(hash);
         case fhExtraHtime:
           final times = _parseFhExtraHtime(raw, fieldSize);
           if (times != null) result = result.withTimes(times);
@@ -1236,6 +1246,24 @@ class ArchiveReader {
       usePswCheck: validPswCheck,
       useHashKey: useHashKey,
     );
+  }
+
+  /// Parses a `FHEXTRA_HASH` record body, mirroring `ProcessExtra50` case
+  /// `FHEXTRA_HASH`. Returns a [_HashResult] or `null` on bad data.
+  _HashResult? _parseFhExtraHash(RawReader raw, int fieldEnd) {
+    final type = raw.getV();
+    switch (type) {
+      case fhExtraHashBlake2:
+        if (raw.readPos + blake2DigestSize > fieldEnd) {
+          return null;
+        }
+        return _HashResult(
+          type: FileHashType.blake2,
+          digest: raw.getB(blake2DigestSize),
+        );
+      default:
+        return null;
+    }
   }
 
   /// Parses a `FHEXTRA_HTIME` record, mirroring `ProcessExtra50` case
@@ -1417,6 +1445,12 @@ class _RedirResult {
   final bool isDir;
 }
 
+class _HashResult {
+  const _HashResult({required this.type, required this.digest});
+  final FileHashType type;
+  final List<int> digest;
+}
+
 /// Aggregates all extra fields parsed from a single `FHEXTRA_*` area.
 class _Extra50Result {
   const _Extra50Result({
@@ -1428,6 +1462,8 @@ class _Extra50Result {
     this.redirectTarget,
     this.redirectTargetIsDir = false,
     this.unixOwner,
+    this.hashType = FileHashType.none,
+    this.blake2Digest,
   });
 
   final CryptInfo? cryptInfo;
@@ -1438,11 +1474,14 @@ class _Extra50Result {
   final String? redirectTarget;
   final bool redirectTargetIsDir;
   final UnixOwnerInfo? unixOwner;
+  final FileHashType hashType;
+  final List<int>? blake2Digest;
 
   _Extra50Result withCrypt(CryptInfo c) => _Extra50Result(
       cryptInfo: c, mtime: mtime, ctime: ctime, atime: atime,
       redirectType: redirectType, redirectTarget: redirectTarget,
-      redirectTargetIsDir: redirectTargetIsDir, unixOwner: unixOwner);
+      redirectTargetIsDir: redirectTargetIsDir, unixOwner: unixOwner,
+      hashType: hashType, blake2Digest: blake2Digest);
 
   _Extra50Result withTimes(_TimesResult t) => _Extra50Result(
       cryptInfo: cryptInfo,
@@ -1450,15 +1489,24 @@ class _Extra50Result {
       ctime: t.ctime ?? ctime,
       atime: t.atime ?? atime,
       redirectType: redirectType, redirectTarget: redirectTarget,
-      redirectTargetIsDir: redirectTargetIsDir, unixOwner: unixOwner);
+      redirectTargetIsDir: redirectTargetIsDir, unixOwner: unixOwner,
+      hashType: hashType, blake2Digest: blake2Digest);
 
   _Extra50Result withRedir(_RedirResult r) => _Extra50Result(
       cryptInfo: cryptInfo, mtime: mtime, ctime: ctime, atime: atime,
       redirectType: r.type, redirectTarget: r.target,
-      redirectTargetIsDir: r.isDir, unixOwner: unixOwner);
+      redirectTargetIsDir: r.isDir, unixOwner: unixOwner,
+      hashType: hashType, blake2Digest: blake2Digest);
 
   _Extra50Result withOwner(UnixOwnerInfo o) => _Extra50Result(
       cryptInfo: cryptInfo, mtime: mtime, ctime: ctime, atime: atime,
       redirectType: redirectType, redirectTarget: redirectTarget,
-      redirectTargetIsDir: redirectTargetIsDir, unixOwner: o);
+      redirectTargetIsDir: redirectTargetIsDir, unixOwner: o,
+      hashType: hashType, blake2Digest: blake2Digest);
+
+  _Extra50Result withHash(_HashResult h) => _Extra50Result(
+      cryptInfo: cryptInfo, mtime: mtime, ctime: ctime, atime: atime,
+      redirectType: redirectType, redirectTarget: redirectTarget,
+      redirectTargetIsDir: redirectTargetIsDir, unixOwner: unixOwner,
+      hashType: h.type, blake2Digest: h.digest);
 }

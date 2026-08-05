@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:neoasis_unrar/io.dart';
 import 'package:neoasis_unrar/neoasis_unrar.dart';
+import 'package:neoasis_unrar/src/blake2s.dart';
 import 'package:test/test.dart';
 
 /// Integration tests against real archives in the sibling `dart_unrar`
@@ -571,7 +572,107 @@ void main() {
           reason: 'should have symlink entry');
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // M9: FHEXTRA_HASH – BLAKE2sp file hashes (-htb archives)
+  // ---------------------------------------------------------------------------
+
+  group('M9: BLAKE2sp file hashes (blake2.rar)', () {
+    final fixturePath = '${Directory.current.path}/test/fixtures/blake2.rar';
+    final refDir = '${Directory.current.path}/test/fixtures/blake2_ref';
+
+    test('entries expose hashType=blake2 and a 32-byte digest', () async {
+      final archive = await openRarFile(fixturePath);
+      addTearDown(archive.close);
+      final entries = await archive.list();
+      expect(entries, hasLength(2));
+      for (final e in entries) {
+        expect(e.hashType, FileHashType.blake2,
+            reason: '${e.name} should carry a BLAKE2 hash');
+        expect(e.blake2Digest, isNotNull);
+        expect(e.blake2Digest!.length, 32);
+      }
+    });
+
+    test('entries without -htb have no hash', () async {
+      // enc_store.rar was created without -htb, so no FHEXTRA_HASH record.
+      final plain = await openRarFile(
+          '${Directory.current.path}/test/fixtures/enc_store.rar');
+      addTearDown(plain.close);
+      final e = (await plain.list()).single;
+      expect(e.hashType, FileHashType.none);
+      expect(e.blake2Digest, isNull);
+    });
+
+    test('extractAll produces byte-exact data matching the reference files',
+        () async {
+      final archive = await openRarFile(fixturePath);
+      addTearDown(archive.close);
+      final extracted = <String, List<int>>{};
+      await archive.extractAll((entry, data) {
+        extracted[entry.name.split('/').last] = data;
+      });
+      expect(extracted.keys.toSet(), {'fox.txt', 'blob.bin'});
+      for (final name in ['fox.txt', 'blob.bin']) {
+        final ref = File('$refDir/$name').readAsBytesSync();
+        expect(extracted[name], ref, reason: '$name does not match reference');
+      }
+    });
+
+    test('stored digest matches the digest computed from the reference file',
+        () async {
+      final archive = await openRarFile(fixturePath);
+      addTearDown(archive.close);
+      final entries = await archive.list();
+      for (final e in entries) {
+        final ref = File('$refDir/${e.name.split('/').last}').readAsBytesSync();
+        expect(_hex(e.blake2Digest!), _hex(Blake2Sp.digest(ref)),
+            reason: '${e.name} stored digest should equal BLAKE2sp(ref)');
+      }
+    });
+  });
+
+  group('M9: BLAKE2 MAC verification (blake2_enc.rar)', () {
+    final fixturePath =
+        '${Directory.current.path}/test/fixtures/blake2_enc.rar';
+    final refDir = '${Directory.current.path}/test/fixtures/blake2_ref';
+    const password = 'testpass';
+
+    test('encrypted entries extract byte-exact with the correct password',
+        () async {
+      final archive = await openRarFile(fixturePath, password: password);
+      addTearDown(archive.close);
+      final entries = await archive.list();
+      expect(entries, hasLength(2));
+      expect(entries.every((e) => e.isEncrypted), isTrue);
+      for (final e in entries) {
+        expect(e.hashType, FileHashType.blake2);
+        expect(e.blake2Digest!.length, 32);
+      }
+      final extracted = <String, List<int>>{};
+      await archive.extractAll((entry, data) {
+        extracted[entry.name.split('/').last] = data;
+      });
+      for (final name in ['fox.txt', 'blob.bin']) {
+        final ref = File('$refDir/$name').readAsBytesSync();
+        expect(extracted[name], ref, reason: '$name does not match reference');
+      }
+    });
+
+    test('wrong password fails BLAKE2 MAC verification', () async {
+      final archive = await openRarFile(fixturePath, password: 'wrongpass');
+      addTearDown(archive.close);
+      final entries = await archive.list();
+      await expectLater(
+        archive.extractFile(entries.first.name),
+        throwsA(isA<UnrarException>()),
+      );
+    });
+  });
 }
+
+String _hex(List<int> bytes) =>
+    bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
 
 class _Expected {
   const _Expected(this.name,

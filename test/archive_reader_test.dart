@@ -3,7 +3,6 @@ import 'dart:typed_data';
 import 'package:neoasis_unrar/src/archive_reader.dart';
 import 'package:neoasis_unrar/src/byte_source.dart';
 import 'package:neoasis_unrar/src/header_constants.dart';
-import 'package:neoasis_unrar/src/unpacker.dart';
 import 'package:neoasis_unrar/src/unrar_error.dart';
 import 'package:test/test.dart';
 
