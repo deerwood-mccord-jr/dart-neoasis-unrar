@@ -259,7 +259,7 @@ surface.
   - `rar4_lz_normal.rar` (libarchive corpus): directories, files, and
     Unix symlink all listed correctly; `redirectType` set for the symlink
 
-## 9. BLAKE2sp file hashes — ✅ done (commit `TBD`)
+## 9. BLAKE2sp file hashes — ✅ done (commit `cea4cbd`)
 
 Port the BLAKE2s/2sp tree hash used by RAR 5.0 `-htb` archives and verify
 stored digests after extraction.
