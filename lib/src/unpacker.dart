@@ -53,14 +53,9 @@ class Unpacker {
   /// Persistent RAR 1.5 decompressor, reused across a solid stream.
   Rar15Unpacker? _rar15;
 
-  /// Unpacks the file whose packed data starts at [dataOffset] in [ByteSource]
-  /// and returns the unpacked bytes.
-  ///
-  /// When [expectedCrc] is non-zero the unpacked data is verified against it
-  /// and a [UnrarException] is thrown on mismatch. When [password] and
   /// Unpacks from a pre-assembled [data] buffer (used for multi-volume
   /// entries where packed fragments have already been concatenated and
-  /// optionally decrypted by [ArchiveReader]).
+  /// optionally decrypted by the caller).
   ///
   /// When [alreadyDecrypted] is `true` the buffer is passed directly to the
   /// decompressor; otherwise [password] + [cryptInfo] are applied first.
@@ -164,6 +159,11 @@ class Unpacker {
     throw UnsupportedMethodException(method, data.length, unpSize);
   }
 
+  /// Unpacks the file whose packed data starts at [dataOffset] in [ByteSource]
+  /// and returns the unpacked bytes.
+  ///
+  /// When [expectedCrc] is non-zero the unpacked data is verified against it
+  /// and a [UnrarException] is thrown on mismatch. When [password] and
   /// [cryptInfo] are supplied the packed data is decrypted before
   /// decompression.
   ///
@@ -210,8 +210,8 @@ class Unpacker {
     throw UnsupportedMethodException(method, packSize, unpSize);
   }
 
-  /// Public wrapper around [_decryptPacked] used by [ArchiveReader] when
-  /// assembling multi-volume packed streams before decompression.
+  /// Public wrapper around [_decryptPacked] used when assembling
+  /// multi-volume packed streams before decompression.
   Uint8List decryptPacked(Uint8List packed, String password,
           CryptInfo cryptInfo, int expectedCrc) =>
       _decryptPacked(packed, password, cryptInfo, expectedCrc);

@@ -6,7 +6,8 @@ import 'header_constants.dart';
 /// For RAR 5.0: mirrors `FileHeader::Salt`, `::InitV`, `::Lg2Count`,
 /// `::PswCheck`, `::UseHashKey` from `headers.hpp`.
 /// For RAR 4.x (`isRar4 == true`): only `salt` is populated (8 bytes);
-/// the AES-128 key and IV are derived by [kdf3] from the password + salt.
+/// the AES-128 key and IV are derived by the `kdf3` function from
+/// `package:neoasis_unrar/src/kdf3.dart` using the password + salt.
 class CryptInfo {
   const CryptInfo({
     required this.isRar4,

@@ -51,8 +51,8 @@ class FileByteSource implements ByteSource {
 }
 
 /// Returns a [VolumeResolver] that looks for the next volume as a file on the
-/// local file system. If [nextName] is a bare file name, it is resolved
-/// relative to the directory that contains [currentName].
+/// local file system. If `nextName` is a bare file name, it is resolved
+/// relative to the directory that contains `currentName`.
 VolumeResolver fileVolumeResolver() {
   return (String currentName, String nextName) async {
     // Resolve relative paths: if nextName has no directory component, place
