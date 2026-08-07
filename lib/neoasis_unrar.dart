@@ -38,9 +38,8 @@ import 'src/byte_source.dart';
 import 'src/header_constants.dart';
 import 'src/volume.dart';
 
-/// An open RAR archive. Stored files and RAR 5.0/7.0 compressed files can be
-/// extracted and CRC-verified; RAR 4.x compressed entries are not supported
-/// yet.
+/// An open RAR archive. Stored files and RAR 5.0/7.0, RAR 4.x, and RAR 1.5
+/// compressed files can be extracted and CRC-verified.
 class RarArchive {
   RarArchive._(this._reader);
 

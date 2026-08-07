@@ -2,14 +2,16 @@
 /// `unpack30.cpp` and `unpackinline.cpp`.
 ///
 /// Implements the RAR 2.x LZSS algorithm (`Unpack20`, unpVer 20/26) and the
-/// RAR 3.x algorithm (`Unpack29`, unpVer 29) with its PPMd blocks. RAR 1.5
-/// (`unpack15.cpp`) and the RAR 3.x virtual machine filters are not ported.
+/// RAR 3.x algorithm (`Unpack29`, unpVer 29) with its PPMd blocks and the
+/// six standard VM filters. RAR 1.5 (`unpack15.cpp`) is not ported; custom
+/// RAR 3.x VM bytecode throws [UnsupportedFilterException].
 library;
 
 import 'dart:typed_data';
 
 import 'bit_input.dart';
 import 'ppmd.dart';
+import 'rarvm.dart';
 import 'unpack5.dart';
 import 'unrar_error.dart';
 
@@ -124,6 +126,14 @@ class Rar4Unpacker {
   int _ppmEscChar = 2;
   final PpmdDecoder _ppm = PpmdDecoder();
 
+  // RAR 3.x VM filter state (`Unpack::Filters30`, `PrgStack`,
+  // `OldFilterLengths`, `LastFilter` and `VM`).
+  final List<VmPreparedProgram?> _filters30 = [];
+  final List<_VmStackFilter?> _prgStack = [];
+  final List<int> _oldFilterLengths = [];
+  int _lastFilter = 0;
+  final RarVm _vm = RarVm();
+
   // Shared window / match state.
   final _oldDist = List<int>.filled(4, -1);
   int _oldDistPtr = 0;
@@ -227,6 +237,7 @@ class Rar4Unpacker {
       _ppmEscChar = 2;
       _unpBlockType = blockLz;
     }
+    _initFilters30(solid);
     _inp.initBitInput();
     _writtenFileSize = 0;
     _readTop = _packedLength;
@@ -291,10 +302,92 @@ class Rar4Unpacker {
     _wrPtr = _unpPtr;
   }
 
-  /// Mirrors `Unpack::UnpWriteBuf30` with no pending VM filters (filters are
-  /// not ported), so it reduces to `UnpWriteArea(WrPtr, UnpPtr)`.
+  /// Mirrors `Unpack::InitFilters30`.
+  void _initFilters30(bool solid) {
+    if (!solid) {
+      _oldFilterLengths.clear();
+      _lastFilter = 0;
+      _filters30.clear();
+    }
+    _prgStack.clear();
+  }
+
+  /// Mirrors `Unpack::UnpWriteBuf30` with the pending VM filters applied.
   void _unpWriteBuf30() {
-    _unpWriteArea(_wrPtr, _unpPtr);
+    var writtenBorder = _wrPtr;
+    var writeSize = (_unpPtr - writtenBorder) & _maxWinMask;
+    for (var i = 0; i < _prgStack.length; i++) {
+      final flt = _prgStack[i];
+      if (flt == null) {
+        continue;
+      }
+      if (flt.nextWindow) {
+        flt.nextWindow = false;
+        continue;
+      }
+      final blockStart = flt.blockStart;
+      final blockLength = flt.blockLength;
+      if (((blockStart - writtenBorder) & _maxWinMask) >= writeSize) {
+        continue;
+      }
+      if (writtenBorder != blockStart) {
+        _unpWriteArea(writtenBorder, blockStart);
+        writtenBorder = blockStart;
+        writeSize = (_unpPtr - writtenBorder) & _maxWinMask;
+      }
+      if (blockLength > writeSize) {
+        // Current filter intersects the window write border, so we adjust
+        // the window border to process this filter next time, not now.
+        for (var j = i; j < _prgStack.length; j++) {
+          final f = _prgStack[j];
+          if (f != null && f.nextWindow) {
+            f.nextWindow = false;
+          }
+        }
+        _wrPtr = writtenBorder;
+        return;
+      }
+      final blockEnd = (blockStart + blockLength) & _maxWinMask;
+      if (blockStart < blockEnd || blockEnd == 0) {
+        _vm.setMemory(0, _window!, blockStart, blockLength);
+      } else {
+        final firstPartLength = _maxWinSize - blockStart;
+        _vm.setMemory(0, _window!, blockStart, firstPartLength);
+        _vm.setMemory(firstPartLength, _window!, 0, blockEnd);
+      }
+
+      final prg = flt.prg;
+      _executeCode(prg);
+      var filteredData = prg.filteredData;
+      var filteredDataSize = prg.filteredDataSize;
+
+      _prgStack[i] = null;
+      while (i + 1 < _prgStack.length) {
+        final nextFilter = _prgStack[i + 1];
+        // It is required to check NextWindow here.
+        if (nextFilter == null ||
+            nextFilter.blockStart != blockStart ||
+            nextFilter.blockLength != filteredDataSize ||
+            nextFilter.nextWindow) {
+          break;
+        }
+
+        // Apply several filters to the same data block.
+        _vm.setMemory(0, filteredData!, 0, filteredDataSize);
+
+        final nextPrg = nextFilter.prg;
+        _executeCode(nextPrg);
+        filteredData = nextPrg.filteredData;
+        filteredDataSize = nextPrg.filteredDataSize;
+        i++;
+        _prgStack[i] = null;
+      }
+      _unpWriteData(filteredData!, filteredDataSize);
+      writtenBorder = blockEnd;
+      writeSize = (_unpPtr - writtenBorder) & _maxWinMask;
+    }
+
+    _unpWriteArea(writtenBorder, _unpPtr);
     _wrPtr = _unpPtr;
   }
 
@@ -1023,13 +1116,212 @@ class Rar4Unpacker {
     return ch;
   }
 
-  /// VM filter code is not ported; mirrors `Unpack::ReadVMCode` by failing
-  /// safely so unpacking stops instead of producing corrupt output.
-  bool _readVmCode() => false;
+  /// Mirrors `Unpack::ReadVMCode` (LZ mode). Reads the VM code marker,
+  /// then decodes and registers the filter described by it.
+  bool _readVmCode() {
+    final inp = _inp;
+    final firstByte = inp.getbits() >> 8;
+    inp.addbits(8);
+    var length = (firstByte & 7) + 1;
+    if (length == 7) {
+      length = (inp.getbits() >> 8) + 7;
+      inp.addbits(8);
+    } else if (length == 8) {
+      length = inp.getbits();
+      inp.addbits(16);
+    }
+    if (length == 0) {
+      return false;
+    }
+    final code = Uint8List(length);
+    for (var i = 0; i < length; i++) {
+      // Try to read the new buffer if only one byte is left. In the
+      // external-buffer mode the whole stream is in memory, so this only
+      // keeps the EOF accounting.
+      if (inp.inAddr >= _readTop - 1 && !_unpReadBuf() && i < length - 1) {
+        return false;
+      }
+      code[i] = inp.getbits() >> 8;
+      inp.addbits(8);
+    }
+    return _addVmCode(firstByte, code);
+  }
 
-  /// VM filter code is not ported; mirrors `Unpack::ReadVMCodePPM` by failing
-  /// safely.
-  bool _readVmCodePpm() => false;
+  /// Mirrors `Unpack::ReadVMCodePPM` (PPM mode).
+  bool _readVmCodePpm() {
+    var firstByte = _safePpmDecodeChar();
+    if (firstByte == -1) {
+      return false;
+    }
+    var length = (firstByte & 7) + 1;
+    if (length == 7) {
+      final b1 = _safePpmDecodeChar();
+      if (b1 == -1) {
+        return false;
+      }
+      length = b1 + 7;
+    } else if (length == 8) {
+      final b1 = _safePpmDecodeChar();
+      if (b1 == -1) {
+        return false;
+      }
+      final b2 = _safePpmDecodeChar();
+      if (b2 == -1) {
+        return false;
+      }
+      length = b1 * 256 + b2;
+    }
+    if (length == 0) {
+      return false;
+    }
+    final code = Uint8List(length);
+    for (var i = 0; i < length; i++) {
+      final ch = _safePpmDecodeChar();
+      if (ch == -1) {
+        return false;
+      }
+      code[i] = ch;
+    }
+    return _addVmCode(firstByte, code);
+  }
+
+  /// Mirrors `Unpack::AddVMCode`. Reads the filter placement parameters,
+  /// records the filter on the pending stack and, for a new filter, decodes
+  /// and prepares its VM bytecode.
+  ///
+  /// Custom VM programs that do not match any of the six standard filters
+  /// throw [UnsupportedFilterException]: the bytecode interpreter is not
+  /// ported, and the C library would silently write nothing for them.
+  bool _addVmCode(int firstByte, Uint8List code) {
+    final vmCodeInp = BitInput.external(code);
+    _vm.init();
+
+    var filtPos = _lastFilter;
+    if ((firstByte & 0x80) != 0) {
+      filtPos = RarVm.readData(vmCodeInp);
+      if (filtPos == 0) {
+        _initFilters30(false);
+      } else {
+        filtPos--;
+      }
+    }
+
+    if (filtPos > _filters30.length || filtPos > _oldFilterLengths.length) {
+      return false;
+    }
+    _lastFilter = filtPos;
+    final newFilter = filtPos == _filters30.length;
+
+    final stackFilter = _VmStackFilter();
+
+    late final VmPreparedProgram filter;
+    if (newFilter) {
+      if (filtPos > max3UnpackFilters) {
+        return false;
+      }
+      stackFilter.parentFilter = _filters30.length;
+      filter = VmPreparedProgram();
+      _filters30.add(filter);
+      _oldFilterLengths.add(0);
+    } else {
+      filter = _filters30[filtPos]!;
+      stackFilter.parentFilter = filtPos;
+    }
+
+    // Compact the null entries left by already-processed filters.
+    var emptyCount = 0;
+    for (var i = 0; i < _prgStack.length; i++) {
+      _prgStack[i - emptyCount] = _prgStack[i];
+      if (_prgStack[i] == null) {
+        emptyCount++;
+      }
+      if (emptyCount > 0) {
+        _prgStack[i] = null;
+      }
+    }
+    if (emptyCount == 0) {
+      if (_prgStack.length > max3UnpackFilters) {
+        return false;
+      }
+      _prgStack.add(null);
+      emptyCount = 1;
+    }
+    final stackPos = _prgStack.length - emptyCount;
+    _prgStack[stackPos] = stackFilter;
+
+    var blockStart = RarVm.readData(vmCodeInp);
+    if ((firstByte & 0x40) != 0) {
+      blockStart += 258;
+    }
+    stackFilter.blockStart = (blockStart + _unpPtr) & _maxWinMask;
+    if ((firstByte & 0x20) != 0) {
+      stackFilter.blockLength = RarVm.readData(vmCodeInp);
+      _oldFilterLengths[filtPos] = stackFilter.blockLength;
+    } else {
+      stackFilter.blockLength = filtPos < _oldFilterLengths.length
+          ? _oldFilterLengths[filtPos]
+          : 0;
+    }
+
+    stackFilter.nextWindow =
+        _wrPtr != _unpPtr && ((_wrPtr - _unpPtr) & _maxWinMask) <= blockStart;
+
+    stackFilter.prg.initR.fillRange(0, 7, 0);
+    stackFilter.prg.initR[4] = stackFilter.blockLength;
+
+    if ((firstByte & 0x10) != 0) {
+      final initMask = vmCodeInp.getbits() >> 9;
+      vmCodeInp.addbits(7);
+      for (var i = 0; i < 7; i++) {
+        if ((initMask & (1 << i)) != 0) {
+          stackFilter.prg.initR[i] = RarVm.readData(vmCodeInp);
+        }
+      }
+    }
+
+    if (newFilter) {
+      final vmCodeSize = RarVm.readData(vmCodeInp);
+      if (vmCodeSize >= 0x10000 ||
+          vmCodeSize == 0 ||
+          vmCodeInp.inAddr + vmCodeSize > code.length) {
+        return false;
+      }
+      final vmCode = Uint8List(vmCodeSize);
+      for (var i = 0; i < vmCodeSize; i++) {
+        if (vmCodeInp.overflow(3)) {
+          return false;
+        }
+        vmCode[i] = vmCodeInp.getbits() >> 8;
+        vmCodeInp.addbits(8);
+      }
+      _vm.prepare(vmCode, filter);
+      if (filter.type == VmStandardFilter.none) {
+        throw const UnsupportedFilterException(
+            'RAR3 VM filter bytecode matches none of the six standard '
+            'filters (E8/E8E9/ITANIUM/DELTA/RGB/AUDIO); the VM interpreter '
+            'is not ported.');
+      }
+    }
+    stackFilter.prg.type = filter.type;
+
+    return true;
+  }
+
+  /// Mirrors `Unpack::ExecuteCode`.
+  void _executeCode(VmPreparedProgram prg) {
+    prg.initR[6] = _writtenFileSize & 0xFFFFFFFF;
+    _vm.execute(prg);
+  }
+}
+
+/// Mirrors `UnpackFilter30` (the per-instance filter state kept on the
+/// pending filter stack).
+class _VmStackFilter {
+  int parentFilter = 0;
+  int blockStart = 0;
+  int blockLength = 0;
+  bool nextWindow = false;
+  final VmPreparedProgram prg = VmPreparedProgram();
 }
 
 /// One-time build of the RAR 3.x distance decode tables (`DDecode`/`DBits`),

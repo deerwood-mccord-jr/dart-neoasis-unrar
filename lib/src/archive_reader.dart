@@ -7,6 +7,7 @@ import 'archive_entry.dart';
 import 'archive_info.dart';
 import 'blake2s.dart';
 import 'byte_source.dart';
+import 'crc.dart';
 import 'enc_name.dart';
 import 'header_constants.dart';
 import 'kdf3.dart';
@@ -37,6 +38,15 @@ class _BlockHeader {
 
   /// Parsed entry for HEAD_FILE blocks.
   ArchiveEntry? entry;
+
+  // RAR 4.x end-of-archive fields (HEAD_ENDARC).
+
+  /// `true` when EARC_NEXT_VOLUME is absent — this is the last volume.
+  bool isLastVolume = false;
+
+  /// `true` when EARC_REVSPACE is set — the last 7 bytes may be zeroed by
+  /// a REV file.  Used to suppress false CRC errors on recovered volumes.
+  bool hasRevSpace = false;
 }
 
 /// Reads archive blocks sequentially from a [ByteSource], ported from the
@@ -331,6 +341,25 @@ class ArchiveReader {
   }
 
   Future<Uint8List> _unpackEntry(ArchiveEntry entry, _BlockHeader head) async {
+    // FSREDIR_FILECOPY and FSREDIR_HARDLINK: resolve the source entry.
+    // Both reference a file already in the archive and have no data area of
+    // their own. Mirrors `ExtractFileCopy` / `ExtractHardlink` in extract.cpp.
+    if (entry.redirectType == FileSystemRedirect.fsRedirFileCopy ||
+        entry.redirectType == FileSystemRedirect.fsRedirHardLink) {
+      final sourceName = entry.redirectTarget;
+      if (sourceName == null || sourceName.isEmpty) {
+        throw UnrarException(
+            'Redirect entry "${entry.name}" has no redirect target');
+      }
+      final source = await extractFile(sourceName);
+      if (source == null) {
+        throw UnrarException(
+            'Redirect entry "${entry.name}" points to missing source '
+            '"$sourceName" (ERAR_EREFERENCE)');
+      }
+      return source;
+    }
+
     if (entry.isEncrypted) {
       if (_password == null) {
         throw const UnrarException(
@@ -351,13 +380,19 @@ class ArchiveReader {
     if (entry.splitAfter) {
       return _unpackSplit(entry, head);
     }
-    return _unpacker.unpack(
+    // For RAR 1.4 entries the crc32 field holds a 16-bit Checksum14 value.
+    // Pass expectedCrc=0 to suppress the CRC32 check inside the unpacker,
+    // then verify manually using checksum14 (mirroring HASH_RAR14 in hash.cpp).
+    final isRar14 = entry.unpVer == 10 || entry.unpVer == 13;
+    final crcForUnpacker = isRar14 ? 0 : entry.crc32;
+
+    final out = await _unpacker.unpack(
       method: entry.method,
       packSize: head.dataSize,
       unpSize: entry.unpSize,
       unknownUnpSize: entry.unknownUnpSize,
       dataOffset: head.dataOffset,
-      expectedCrc: entry.crc32,
+      expectedCrc: crcForUnpacker,
       unpVer: entry.unpVer,
       windowSize: entry.windowSize,
       solid: entry.isSolid,
@@ -366,6 +401,17 @@ class ArchiveReader {
       hashType: entry.hashType,
       blake2Digest: entry.blake2Digest,
     );
+
+    if (isRar14 && entry.crc32 != 0) {
+      final actual = checksum14(0, out);
+      if (actual != entry.crc32) {
+        throw UnrarException(
+            'Checksum14 mismatch for RAR 1.4 entry "${entry.name}" '
+            '(expected 0x${entry.crc32.toRadixString(16)}, '
+            'got 0x${actual.toRadixString(16)})');
+      }
+    }
+    return out;
   }
 
   /// Assembles packed data for an entry that spans multiple volumes, then
@@ -401,14 +447,24 @@ class ArchiveReader {
             'Cannot locate next volume: $nextName');
       }
 
-      // Open a temporary reader for the next volume (same password, no
-      // volume resolver since we manage the chain ourselves).
+      // Open a temporary reader for the next volume, passing through the
+      // password and volume resolver so chains of 3+ volumes are followed.
       final nextReader = ArchiveReader(
         nextSource,
         password: _password,
         archiveName: nextName,
+        volumeResolver: _volumeResolver,
       );
       await nextReader.init();
+
+      // Mirror volume.cpp:148-156: abort if encrypted-header state changes
+      // across the volume boundary (prevents volume-injection attacks).
+      if (nextReader.isEncrypted != _encrypted) {
+        await nextSource.close();
+        throw const UnrarException(
+            'Volume encryption state changed between volumes — '
+            'possible volume injection attack');
+      }
 
       // Find the continuation entry (splitBefore=true) in the next volume.
       _BlockHeader? contHead;
@@ -571,8 +627,10 @@ class ArchiveReader {
 
     final dataSize = raw[0] | (raw[1] << 8) | (raw[2] << 16) | (raw[3] << 24);
     final unpSize = raw[4] | (raw[5] << 8) | (raw[6] << 16) | (raw[7] << 24);
-    // raw[8..9] = RAR 1.4 16-bit checksum (stored for reference, not verified
-    // since the hash format differs from CRC32).
+    // raw[8..9] = RAR 1.4 16-bit checksum (`HASH_RAR14`).
+    // Store it directly in crc32; it will be verified after extraction
+    // using checksum14() rather than crc32Of().
+    final checksum = raw[8] | (raw[9] << 8);
     final headSize = raw[10] | (raw[11] << 8);
     if (headSize < minSize) return null;
     final fileTime = raw[12] | (raw[13] << 8) | (raw[14] << 16) | (raw[15] << 24);
@@ -612,10 +670,9 @@ class ArchiveReader {
       isSolid: false,
       splitBefore: (flags14 & lhdSplitBefore) != 0,
       splitAfter: (flags14 & lhdSplitAfter) != 0,
-      // RAR 1.4 uses a different 16-bit hash; store it as-is. Extraction
-      // uses method 0 (stored) and skips CRC verification since the hash
-      // format differs from CRC32.
-      crc32: 0, // RAR14 hash not compatible with our CRC32 verifier
+      // RAR 1.4 stores a 16-bit Checksum14 value (rotate-add, not CRC32).
+      // Store it in the crc32 field; _unpack15 will verify using checksum14().
+      crc32: checksum,
       modifiedTime: dosTimeToDateTime(fileTime),
       method: method,
       unpVer: unpVer,
@@ -699,12 +756,97 @@ class ArchiveReader {
           isService: head.type == HeaderType.headService,
         );
         _nextBlockPos = (_nextBlockPos + head.dataSize) & 0xFFFFFFFFFFFFFFFF;
+        // RAR 3.x/4.x Unix symlinks: the target path is stored as the file's
+        // data (always method=0, no encryption).  Read it eagerly so that
+        // callers see a populated redirectTarget after list().  Mirrors
+        // `ExtractUnixLink30` in `ulinks.cpp`.
+        final e = head.entry;
+        if (e != null &&
+            e.redirectType == FileSystemRedirect.fsRedirUnixSymlink &&
+            e.redirectTarget == null &&
+            e.method == 0 &&
+            head.dataSize > 0 &&
+            head.dataSize <= maxPathSize &&
+            !e.isEncrypted) {
+          final savedPos = _nextBlockPos;
+          await _source.seek(head.dataOffset);
+          final targetBytes = await _readExact(head.dataSize);
+          final end = targetBytes.indexOf(0);
+          final slice =
+              end == -1 ? targetBytes : targetBytes.sublist(0, end);
+          // Target path is stored as bytes in the host locale; UTF-8 on Unix.
+          final target = utf8.decode(slice, allowMalformed: true);
+          head.entry = ArchiveEntry(
+            name: e.name,
+            packSize: e.packSize,
+            unpSize: e.unpSize,
+            isDirectory: e.isDirectory,
+            isEncrypted: e.isEncrypted,
+            isSolid: e.isSolid,
+            splitBefore: e.splitBefore,
+            splitAfter: e.splitAfter,
+            crc32: e.crc32,
+            modifiedTime: e.modifiedTime,
+            createdTime: e.createdTime,
+            accessedTime: e.accessedTime,
+            method: e.method,
+            unpVer: e.unpVer,
+            hostOs: e.hostOs,
+            fileAttr: e.fileAttr,
+            flags: e.flags,
+            windowSize: e.windowSize,
+            unknownUnpSize: e.unknownUnpSize,
+            isService: e.isService,
+            hostSystemType: e.hostSystemType,
+            cryptInfo: e.cryptInfo,
+            redirectType: e.redirectType,
+            redirectTarget: target,
+            redirectTargetIsDir: e.redirectTargetIsDir,
+            unixOwner: e.unixOwner,
+            hashType: e.hashType,
+            blake2Digest: e.blake2Digest,
+          );
+          // Restore _nextBlockPos (seek does not move _nextBlockPos).
+          _nextBlockPos = savedPos;
+        }
         break;
       case HeaderType.headEndArc:
+        // Parse EARC flags so we can detect the RevSpace guard below.
+        // EARC_NEXT_VOLUME / EARC_DATACRC / EARC_REVSPACE / EARC_VOLNUMBER.
+        final earcNextVol = (head.flags & earcNextVolume) != 0;
+        final earcDataCrc = (head.flags & 0x0002) != 0;
+        if (earcDataCrc) raw.skip(4); // 4-byte archive CRC (ignored).
+        final earcRevSp = (head.flags & earcRevSpace) != 0;
+        if ((head.flags & earcVolNumber) != 0) raw.skip(2); // 2-byte volume number.
+        head.isLastVolume = !earcNextVol;
+        head.hasRevSpace = earcRevSp;
         break;
       case HeaderType.head3Protect:
         head.dataSize = raw.get4();
         _nextBlockPos = (_nextBlockPos + head.dataSize) & 0xFFFFFFFFFFFFFFFF;
+        break;
+      case HeaderType.head3Cmt:
+        // Old standalone comment header (HEAD3_CMT, 0x75).  Reads the 6-byte
+        // comment sub-header fields; sets the comment flag.  The comment text
+        // is compressed and lives after headSize — skip it (headSize already
+        // accounts for the full header, no separate data area).
+        raw.skip(2); // UnpSize
+        raw.skip(1); // UnpVer
+        raw.skip(1); // Method
+        raw.skip(2); // CommCRC
+        _info.comment = true;
+        break;
+      case HeaderType.head3Av:
+      case HeaderType.head3Sign:
+        // AV (0x76) and signature (0x79) headers: no data area; CRC is not
+        // reliable on these blocks (intentional in the C source). Nothing to
+        // parse — just let _nextBlockPos stay at headSize.
+        break;
+      case HeaderType.head3OldService:
+        // RAR 2.x subblock (HEAD3_OLDSERVICE, 0x77).  DataSize(4) precedes
+        // the sub-type fields and the data area follows the header.
+        final dataSize3 = raw.get4();
+        _nextBlockPos = (_nextBlockPos + dataSize3) & 0xFFFFFFFFFFFFFFFF;
         break;
       default:
         if ((head.flags & longBlock) != 0) {
@@ -714,7 +856,27 @@ class ArchiveReader {
 
     final headerCrc = raw.getCRC15();
     if (head.headCrc != headerCrc) {
-      _brokenHeader = true;
+      // AV and signature blocks have unreliable CRCs (intentional in the C
+      // source — arcread.cpp:520-521); do not mark the archive as broken.
+      final crcNotReliable = head.type == HeaderType.head3Av ||
+          head.type == HeaderType.head3Sign;
+
+      // Mirror arcread.cpp:524-547: if the end-of-archive header has
+      // EARC_REVSPACE set, the last 7 bytes of the file may have been
+      // overwritten with zeroes by a REV recovery tool.  If they are all
+      // zero, treat the header as intact rather than marking it broken.
+      bool recovered = false;
+      if (head.hasRevSpace) {
+        final len = await _source.length();
+        if (len >= 7) {
+          await _source.seek(len - 7);
+          final tail = await _source.read(7);
+          recovered = tail.length == 7 && tail.every((b) => b == 0);
+        }
+      }
+      if (!crcNotReliable && !recovered) {
+        _brokenHeader = true;
+      }
     }
     return head;
   }
@@ -776,8 +938,13 @@ class ArchiveReader {
     }
 
     var modifiedTime = dosTimeToDateTime(fileTime);
+    DateTime? createdTime15;
+    DateTime? accessedTime15;
     if ((head.flags & lhdExtTime) != 0) {
-      modifiedTime = _parseExtTime(raw, fileTime, modifiedTime);
+      final ext = _parseExtTime(raw, fileTime, modifiedTime);
+      modifiedTime = ext.mtime;
+      createdTime15 = ext.ctime;
+      accessedTime15 = ext.atime;
     }
 
     final isDir = (head.flags & lhdWindowMask) == lhdDirectory;
@@ -804,6 +971,8 @@ class ArchiveReader {
       splitAfter: (head.flags & lhdSplitAfter) != 0,
       crc32: fileCrc,
       modifiedTime: modifiedTime,
+      createdTime: createdTime15,
+      accessedTime: accessedTime15,
       method: method,
       unpVer: unpVer,
       hostOs: hostOs,
@@ -838,11 +1007,20 @@ class ArchiveReader {
     return String.fromCharCodes(slice);
   }
 
-  /// Reads the RAR 4.x extended time field and returns the (possibly
-  /// adjusted) modification time.
-  DateTime _parseExtTime(RawReader raw, int fileTime, DateTime base) {
+  /// Parses the RAR 4.x extended time field (`LHD_EXTTIME`) and returns a
+  /// record containing modification time, creation time, and last-access time.
+  /// Mirrors `Archive::ReadExt` / the `LHD_EXTTIME` branch in `arcread.cpp`.
+  ///
+  /// Loop index mapping:
+  ///   0 → mtime (uses the DOS [fileTime] as base, no extra 4-byte field)
+  ///   1 → ctime
+  ///   2 → atime
+  ///   3 → archive time (skipped — neoasis does not track archive-level time)
+  _ExtTime15 _parseExtTime(RawReader raw, int fileTime, DateTime base) {
     final extFlags = raw.get2();
-    var modified = base;
+    var mtime = base;
+    DateTime? ctime;
+    DateTime? atime;
     for (var i = 0; i < 4; i++) {
       final rmode = (extFlags >> ((3 - i) * 4)) & 0xf;
       // Index 3 (archive time) is unused.
@@ -860,14 +1038,18 @@ class ArchiveReader {
         final curByte = raw.get1();
         reminder |= curByte << ((j + 3 - count) * 8);
       }
+      // reminder is in units of 100 ns; convert to microseconds.
+      final us = (reminder * 100) ~/ 1000;
+      final precise = dt.add(Duration(microseconds: us));
       if (i == 0) {
-        // reminder is in units of 100 ns; convert to microseconds.
-        final us = (reminder * 100) ~/ 1000;
-        modified = dt.add(Duration(microseconds: us));
+        mtime = precise;
+      } else if (i == 1) {
+        ctime = precise;
+      } else if (i == 2) {
+        atime = precise;
       }
-      // ctime/atime (i == 1, 2) are not exposed by the entry model yet.
     }
-    return modified;
+    return _ExtTime15(mtime: mtime, ctime: ctime, atime: atime);
   }
 
   // ---------------------------------------------------------------------
@@ -1407,12 +1589,20 @@ class ArchiveReader {
         return HeaderType.headMain;
       case 0x74:
         return HeaderType.headFile;
+      case 0x75:
+        return HeaderType.head3Cmt;
+      case 0x76:
+        return HeaderType.head3Av;
+      case 0x77:
+        return HeaderType.head3OldService;
+      case 0x78:
+        return HeaderType.head3Protect;
+      case 0x79:
+        return HeaderType.head3Sign;
       case 0x7a:
         return HeaderType.headService;
       case 0x7b:
         return HeaderType.headEndArc;
-      case 0x78:
-        return HeaderType.head3Protect;
       default:
         return HeaderType.headUnknown;
     }
@@ -1521,4 +1711,13 @@ class _Extra50Result {
       redirectType: redirectType, redirectTarget: redirectTarget,
       redirectTargetIsDir: redirectTargetIsDir, unixOwner: unixOwner,
       hashType: h.type, blake2Digest: h.digest);
+}
+
+/// Return value of [ArchiveReader._parseExtTime], carrying the three RAR 4.x
+/// extended timestamps (modification, creation, last-access).
+class _ExtTime15 {
+  const _ExtTime15({required this.mtime, this.ctime, this.atime});
+  final DateTime mtime;
+  final DateTime? ctime;
+  final DateTime? atime;
 }

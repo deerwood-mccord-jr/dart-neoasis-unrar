@@ -11,6 +11,7 @@ import 'kdf3.dart';
 import 'kdf5.dart';
 import 'unpack4.dart';
 import 'unpack5.dart';
+import 'unpack15.dart';
 import 'unrar_error.dart';
 
 /// The packed data uses a compression method that is not implemented yet.
@@ -33,10 +34,9 @@ class UnsupportedMethodException extends UnrarException {
 /// Decompresses a single entry's packed data stream, ported from the C
 /// `Unpack` class (`unpack.cpp`).
 ///
-/// Method 0 (stored), the RAR 5.0/7.0 decompressor ([Rar5Unpacker]) and the
-/// RAR 4.x decompressor ([Rar4Unpacker], unpVer 20/26/29) are implemented.
-/// RAR 1.5 (unpVer 15) is not; [Unpacker.unpack] throws
-/// [UnsupportedMethodException] for it.
+/// Method 0 (stored), the RAR 5.0/7.0 decompressor ([Rar5Unpacker]), the
+/// RAR 4.x decompressor ([Rar4Unpacker], unpVer 20/26/29), and the RAR 1.5
+/// decompressor ([Rar15Unpacker], unpVer 10/13/15) are all implemented.
 class Unpacker {
   Unpacker(this._source);
 
@@ -49,6 +49,9 @@ class Unpacker {
 
   /// Persistent RAR 4.x decompressor, reused across a solid stream.
   Rar4Unpacker? _rar4;
+
+  /// Persistent RAR 1.5 decompressor, reused across a solid stream.
+  Rar15Unpacker? _rar15;
 
   /// Unpacks the file whose packed data starts at [dataOffset] in [ByteSource]
   /// and returns the unpacked bytes.
@@ -143,6 +146,21 @@ class Unpacker {
       return out;
     }
 
+    if (unpVer == 10 || unpVer == 13 || unpVer == 15) {
+      final rar15 = _rar15 ??= Rar15Unpacker();
+      final out = rar15.unpack15(
+          packed: packed, unpSize: unpSize, solid: solid);
+      if (expectedCrc != 0) {
+        final actualCrc = crc32Of(out);
+        if (actualCrc != expectedCrc) {
+          throw UnrarException(
+              'CRC32 mismatch for RAR 1.5 split entry '
+              '(expected $expectedCrc, got $actualCrc)');
+        }
+      }
+      return out;
+    }
+
     throw UnsupportedMethodException(method, data.length, unpSize);
   }
 
@@ -183,6 +201,11 @@ class Unpacker {
           expectedCrc, windowSize, solid, unpVer,
           password: password, cryptInfo: cryptInfo,
           hashType: hashType, blake2Digest: blake2Digest);
+    }
+    if (unpVer == 10 || unpVer == 13 || unpVer == 15) {
+      return _unpack15(packSize, unpSize, unknownUnpSize, dataOffset,
+          expectedCrc, solid,
+          password: password, cryptInfo: cryptInfo);
     }
     throw UnsupportedMethodException(method, packSize, unpSize);
   }
@@ -422,6 +445,38 @@ class Unpacker {
       }
     }
     _verifyFileHash(out, hashType, blake2Digest, cryptInfo, password);
+    return out;
+  }
+
+  /// RAR 1.5 compressed entry (unpVer 10/13/15).
+  Future<Uint8List> _unpack15(
+    int packSize,
+    int unpSize,
+    bool unknownUnpSize,
+    int dataOffset,
+    int expectedCrc,
+    bool solid, {
+    String? password,
+    CryptInfo? cryptInfo,
+  }) async {
+    await _source.seek(dataOffset);
+    var packed = await _readUpTo(packSize);
+    if (cryptInfo != null && password != null) {
+      packed = _decryptPacked(packed, password, cryptInfo, expectedCrc);
+    }
+    final rar15 = _rar15 ??= Rar15Unpacker();
+    final out = rar15.unpack15(packed: packed, unpSize: unpSize, solid: solid);
+    // RAR 1.4/1.5 use Checksum14, not CRC32; expectedCrc is stored as 0
+    // for RAR 1.4 entries (no CRC32 stored).  For RAR 1.5 compressed entries
+    // the header stores a full CRC32, so verify when non-zero.
+    if (expectedCrc != 0) {
+      final actualCrc = crc32Of(out);
+      if (actualCrc != expectedCrc) {
+        throw UnrarException(
+            'CRC32 mismatch for RAR 1.5 entry '
+            '(expected $expectedCrc, got $actualCrc)');
+      }
+    }
     return out;
   }
 

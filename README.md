@@ -29,6 +29,11 @@ Implemented (ported and unit-tested):
 - RAR 4.x decompression (unpVer 20/26/29): LZSS window decoder and the PPMd
   range-coder + model variant, with solid-stream state reuse
   (`unpack20.cpp`, `unpack30.cpp`, `model.cpp`, `suballoc.cpp`)
+- **RAR 3.x VM filters**: the six named standard filters (E8/E8E9, ITANIUM,
+  DELTA, RGB, AUDIO) decode through the RAR 2.9/3.x path; bytecode matching
+  none of them throws `UnsupportedFilterException` instead of silently
+  truncating output (`rarvm.cpp`, `unpack30.cpp`)
+- RAR 1.5 decompression (unpVer 10/13/15): Huffman + LZ (`unpack15.cpp`)
 - **Encryption (M6)**: AES-128/256, SHA-1, SHA-256, HMAC-SHA256, RAR 4.x KDF
   and RAR 5.0 PBKDF2 KDF; RAR 4.x + RAR 5.0 data decryption; RAR 3/4 and
   RAR 5.0 header decryption (`-hp`); password API
