@@ -7,20 +7,22 @@ import 'package:neoasis_unrar/src/blake2s.dart';
 import 'package:neoasis_unrar/src/crc.dart';
 import 'package:test/test.dart';
 
-/// Integration tests against real archives in the sibling `dart_unrar`
-/// repository (`../dart_unrar/test_data` and `test/fixtures`).
+/// Integration tests against real archives vendored into this repo under
+/// `test/corpus` (mirror of the `dart_unrar` corpus: `test_data` archives,
+/// their `sources/`, and the `test/fixtures/test.rar` archive).
 ///
 /// Ground truth (entry names in archive order, unpacked/compressed sizes,
 /// directory markers) was captured with `unrar lb` / `unrar lt` 7.x. The
-/// whole suite is skipped when the `dart_unrar` checkout is not present.
+/// corpus is self-contained; the whole suite is skipped only if it is absent.
 void main() {
   final corpus = _corpusRoot();
   if (corpus == null) {
-    test('real archive corpus not found', () {}, skip: 'dart_unrar repo absent');
+    test('real archive corpus not found', () {},
+        skip: 'test/corpus vendored archives absent');
     return;
   }
 
-  group('real archives (dart_unrar corpus)', () {
+  group('real archives (corpus)', () {
     for (final c in _cases) {
       test('${c.label} lists entries matching unrar', () async {
         final archive = await openRarFile(_path(c.path));
@@ -1045,7 +1047,7 @@ class _Case {
 String _path(String rel) => '${_corpusRoot()!.path}/$rel';
 
 /// Maps the base name of an extracted entry to its source file inside the
-/// `dart_unrar/test_data` tree.
+/// vendored `test/corpus/test_data` tree.
 String _sourceFor(String name) {
   final root = _corpusRoot()!;
   if (name == 'nested.txt') {
@@ -1057,6 +1059,9 @@ String _sourceFor(String name) {
 Directory? _corpusRoot() {
   final cwd = Directory.current;
   final candidates = [
+    // Vendored copy in this repo.
+    Directory('${cwd.path}/test/corpus'),
+    // Fallback: the sibling `dart_unrar` checkout.
     Directory('${cwd.path}/../dart_unrar'),
     Directory('${cwd.path}/dart_unrar'),
   ];

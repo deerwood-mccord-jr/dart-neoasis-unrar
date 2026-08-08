@@ -1,2 +1,3 @@
 # Keep published package lean: consumers don't need our test archives.
 test/fixtures/
+test/corpus/
