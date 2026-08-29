@@ -8,6 +8,7 @@ const int sizofMainHead3 = 13;
 const int sizofFileHead3 = 32;
 const int sizofShortBlockHead = 7;
 const int sizofLongBlockHead = 11;
+const int sizofCommHead = 13;
 
 // RAR 5.0 sizes.
 const int sizofMarkHead5 = 8;

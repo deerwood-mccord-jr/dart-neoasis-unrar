@@ -99,6 +99,7 @@ class Rar4Unpacker {
   Uint8List? _window;
   int _maxWinSize = 0;
   int _maxWinMask = 0;
+  int _totalUnpSize = 0;
 
   // Shared Huffman tables (LD/DD/LDD/RD/BD for v29, LD/DD/RD/BD for v20).
   final _ld = DecodeTable();
@@ -165,6 +166,7 @@ class Rar4Unpacker {
     _inp = BitInput.external(packed);
     _packedLength = packed.length;
     _destUnpSize = unpSize;
+    _totalUnpSize = unpSize;
     _initWin(windowSize, solid);
     switch (unpVer) {
       case 20:
@@ -287,17 +289,36 @@ class Rar4Unpacker {
     }
   }
 
-  /// Mirrors `Unpack::UnpWriteBuf20`. Writes the window segment between
-  /// [WrPtr] and [UnpPtr], wrapping around the window end.
+  /// Mirrors `Unpack::UnpWriteBuf20`. Unlike the v29/v30 paths, the C v20
+  /// write routine targets `UnpIO->UnpWrite` directly and is NOT gated on
+  /// `DestUnpSize`, because by the time the final flush happens after the
+  /// v20 loop the remaining size has already been decremented to -1. The
+  /// loop guarantees exactly `unpSize` output positions were produced, so we
+  /// only cap against the original destination size to avoid overrun on
+  /// malformed or solid streams.
   void _unpWriteBuf20() {
     final window = _window!;
-    if (_unpPtr < _wrPtr) {
-      _unpWriteData(Uint8List.sublistView(window, _wrPtr, _maxWinSize),
-          _maxWinSize - _wrPtr);
-      _unpWriteData(Uint8List.sublistView(window, 0, _unpPtr), _unpPtr);
-    } else {
-      _unpWriteData(
-          Uint8List.sublistView(window, _wrPtr, _unpPtr), _unpPtr - _wrPtr);
+    var writeSize = _unpPtr < _wrPtr
+        ? (_maxWinSize - _wrPtr) + _unpPtr
+        : (_unpPtr - _wrPtr);
+    final leftToWrite = _totalUnpSize - _writtenFileSize;
+    if (writeSize > leftToWrite) {
+      writeSize = leftToWrite;
+    }
+    if (writeSize > 0) {
+      if (_unpPtr < _wrPtr) {
+        final firstPart = _maxWinSize - _wrPtr;
+        if (writeSize <= firstPart) {
+          _output.add(Uint8List.sublistView(window, _wrPtr, _wrPtr + writeSize));
+        } else {
+          _output
+            ..add(Uint8List.sublistView(window, _wrPtr, _maxWinSize))
+            ..add(Uint8List.sublistView(window, 0, _unpPtr));
+        }
+      } else {
+        _output.add(Uint8List.sublistView(window, _wrPtr, _wrPtr + writeSize));
+      }
+      _writtenFileSize += writeSize;
     }
     _wrPtr = _unpPtr;
   }

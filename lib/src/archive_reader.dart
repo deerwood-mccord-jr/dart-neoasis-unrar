@@ -727,7 +727,28 @@ class ArchiveReader {
       return null;
     }
 
-    await raw.read(head.headSize - sizofShortBlockHead);
+    // Mirror arcread.cpp:203-221: a comment block (HEAD3_CMT) and a main
+    // header with an embedded pre-RAR 3.0 comment (MHD_COMMENT) only CRC the
+    // fixed header fields, not the (possibly compressed) comment body, so
+    // read only those fields here and let _nextBlockPos skip the rest.
+    //
+    // Read no more than the block actually contains: well-formed in-header
+    // comments (headSize >= SIZEOF_MAINHEAD3) read the fixed 6 bytes of the
+    // main fields; degenerate blocks that are smaller (e.g. RAR 2.x archives
+    // that flag MHD_COMMENT but store the comment as a separate HEAD3_CMT
+    // block) have their CRC computed over the base fields alone.
+    if (head.type == HeaderType.head3Cmt) {
+      final fixed = sizofCommHead - sizofShortBlockHead;
+      final extra = head.headSize - sizofShortBlockHead;
+      await raw.read(fixed < extra ? fixed : extra);
+    } else if (head.type == HeaderType.headMain &&
+        (head.flags & mhdComment) != 0) {
+      final fixed = sizofMainHead3 - sizofShortBlockHead;
+      final extra = head.headSize - sizofShortBlockHead;
+      await raw.read(fixed < extra ? fixed : extra);
+    } else {
+      await raw.read(head.headSize - sizofShortBlockHead);
+    }
 
     _nextBlockPos = _blockPos + head.headSize;
     head.dataOffset = _nextBlockPos;
@@ -854,7 +875,12 @@ class ArchiveReader {
         }
     }
 
-    final headerCrc = raw.getCRC15();
+    // File/service headers with an embedded comment (LHD_COMMENT) only CRC
+    // the parsed fields, excluding the comment body (arcread.cpp:430).
+    final commentInHeader = (head.type == HeaderType.headFile ||
+            head.type == HeaderType.headService) &&
+        (head.flags & lhdComment) != 0;
+    final headerCrc = raw.getCRC15(processedOnly: commentInHeader);
     if (head.headCrc != headerCrc) {
       // AV and signature blocks have unreliable CRCs (intentional in the C
       // source — arcread.cpp:520-521); do not mark the archive as broken.
