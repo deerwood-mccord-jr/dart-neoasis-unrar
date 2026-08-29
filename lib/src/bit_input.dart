@@ -2,6 +2,30 @@ import 'dart:typed_data';
 
 import 'raw_int.dart';
 
+/// Compressed input storage with zero padding for the bit reader's deliberate
+/// look-ahead reads.
+///
+/// [length] is the logical compressed length. Bytes after it are capacity only
+/// and must never be treated as part of the compressed stream.
+class PaddedInput {
+  PaddedInput(this.bytes, this.length)
+      : assert(length >= 0),
+        assert(bytes.length >= length + paddingSize);
+
+  factory PaddedInput.copyOf(Uint8List data) {
+    final bytes = Uint8List(data.length + paddingSize);
+    bytes.setRange(0, data.length, data);
+    return PaddedInput(bytes, data.length);
+  }
+
+  static const int paddingSize = 16;
+
+  final Uint8List bytes;
+  final int length;
+
+  Uint8List get data => Uint8List.sublistView(bytes, 0, length);
+}
+
 /// Bit-level input reader, ported from the RARLAB UnRAR source
 /// (`getbits.hpp` / `getbits.cpp`).
 ///
@@ -23,14 +47,10 @@ class BitInput {
   ///
   /// Extra zero bytes are appended so the 64-bit readers can over-read
   /// safely at the end of the stream even for tiny or damaged blocks.
-  BitInput.external(Uint8List data)
-      : _buffer = _padExternal(data);
+  BitInput.external(Uint8List data) : this.padded(PaddedInput.copyOf(data));
 
-  static Uint8List _padExternal(Uint8List data) {
-    final padded = Uint8List(data.length + 16);
-    padded.setRange(0, data.length, data);
-    return padded;
-  }
+  /// Uses storage that already includes the required zero padding.
+  BitInput.padded(PaddedInput data) : _buffer = data.bytes;
 
   /// The input buffer. Compressed data is loaded into this buffer before
   /// reading bits; 8 extra bytes are kept zeroed so the 64-bit readers can

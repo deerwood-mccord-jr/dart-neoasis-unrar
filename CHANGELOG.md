@@ -1,3 +1,12 @@
+## Unreleased
+
+- Optimized pure-Dart extraction with zero-copy padded packed input,
+  exact/discard output sinks, incremental integrity checks, faster overlapping
+  LZ copies, slicing-by-8 CRC32, and allocation-reduced AES-CBC.
+- `testArchive()` now validates data without retaining extracted payloads.
+- Reduced listing overhead with contiguous header buffers and cached file
+  position/length; reused per-entry RAR5 KDF state and clear it on close.
+
 ## 0.2.0
 
 - RAR 3.x VM standard filters ported from `rarvm.cpp`/`unpack30.cpp`:

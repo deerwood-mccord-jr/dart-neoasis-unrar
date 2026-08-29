@@ -330,6 +330,23 @@ stored digests after extraction.
     wrong one
   - archives created without `-htb` expose `hashType=none` / `null` digest
 
+## 10. Pure-Dart optimization pass — ✅ done (IMPL-0001)
+
+- Padded typed packed input removes decoder setup copies while preserving safe
+  lookahead at the logical end of compressed data.
+- Exact-size and discard output sinks perform CRC32, Checksum14, and BLAKE2sp
+  incrementally; archive test mode no longer retains extracted payloads.
+- RAR 3/4 and RAR 5 decoders share optimized overlap-safe LZ match copying.
+- Header parsing uses one contiguous typed buffer; file sources cache physical
+  position and length rather than querying the OS for every header.
+- RAR5 KDF results are reused for decrypt/check/MAC operations within the
+  reader and cleared on close; AES-CBC reuses a block scratch buffer.
+- CRC32 uses a tested slicing-by-8 path for payloads and the short byte path
+  for tails. The higher-risk bit-reservoir experiment was not warranted by the
+  available post-change measurements.
+- Full analyzer and 171-test gates pass. See
+  `devdocs/BENCH-001-dart_unrar_vs_neoasis_unrar.md` §9 for measurements.
+
 ---
 
 ## Cross-cutting notes

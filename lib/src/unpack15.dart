@@ -18,50 +18,101 @@ library;
 import 'dart:typed_data';
 
 import 'bit_input.dart';
+import 'unpack_output.dart';
 
 // Huffman decode tables (static constants from unpack15.cpp).
 
 const int _startL1 = 2;
 const List<int> _decL1 = [
-  0x8000, 0xa000, 0xc000, 0xd000, 0xe000, 0xea00, 0xee00, 0xf000,
-  0xf200, 0xf200, 0xffff,
+  0x8000,
+  0xa000,
+  0xc000,
+  0xd000,
+  0xe000,
+  0xea00,
+  0xee00,
+  0xf000,
+  0xf200,
+  0xf200,
+  0xffff,
 ];
 const List<int> _posL1 = [0, 0, 0, 2, 3, 5, 7, 11, 16, 20, 24, 32, 32];
 
 const int _startL2 = 3;
 const List<int> _decL2 = [
-  0xa000, 0xc000, 0xd000, 0xe000, 0xea00, 0xee00, 0xf000, 0xf200,
-  0xf240, 0xffff,
+  0xa000,
+  0xc000,
+  0xd000,
+  0xe000,
+  0xea00,
+  0xee00,
+  0xf000,
+  0xf200,
+  0xf240,
+  0xffff,
 ];
 const List<int> _posL2 = [0, 0, 0, 0, 5, 7, 9, 13, 18, 22, 26, 34, 36];
 
 const int _startHf0 = 4;
 const List<int> _decHf0 = [
-  0x8000, 0xc000, 0xe000, 0xf200, 0xf200, 0xf200, 0xf200, 0xf200, 0xffff,
+  0x8000,
+  0xc000,
+  0xe000,
+  0xf200,
+  0xf200,
+  0xf200,
+  0xf200,
+  0xf200,
+  0xffff,
 ];
 const List<int> _posHf0 = [0, 0, 0, 0, 0, 8, 16, 24, 33, 33, 33, 33, 33];
 
 const int _startHf1 = 5;
 const List<int> _decHf1 = [
-  0x2000, 0xc000, 0xe000, 0xf000, 0xf200, 0xf200, 0xf7e0, 0xffff,
+  0x2000,
+  0xc000,
+  0xe000,
+  0xf000,
+  0xf200,
+  0xf200,
+  0xf7e0,
+  0xffff,
 ];
 const List<int> _posHf1 = [0, 0, 0, 0, 0, 0, 4, 44, 60, 76, 80, 80, 127];
 
 const int _startHf2 = 5;
 const List<int> _decHf2 = [
-  0x1000, 0x2400, 0x8000, 0xc000, 0xfa00, 0xffff, 0xffff, 0xffff,
+  0x1000,
+  0x2400,
+  0x8000,
+  0xc000,
+  0xfa00,
+  0xffff,
+  0xffff,
+  0xffff,
 ];
 const List<int> _posHf2 = [0, 0, 0, 0, 0, 0, 2, 7, 53, 117, 233, 0, 0];
 
 const int _startHf3 = 6;
 const List<int> _decHf3 = [
-  0x800, 0x2400, 0xee00, 0xfe80, 0xffff, 0xffff, 0xffff,
+  0x800,
+  0x2400,
+  0xee00,
+  0xfe80,
+  0xffff,
+  0xffff,
+  0xffff,
 ];
 const List<int> _posHf3 = [0, 0, 0, 0, 0, 0, 0, 2, 16, 218, 251, 0, 0];
 
 const int _startHf4 = 8;
 const List<int> _decHf4 = [
-  0xff00, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+  0xff00,
+  0xffff,
+  0xffff,
+  0xffff,
+  0xffff,
+  0xffff,
 ];
 const List<int> _posHf4 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 0, 0, 0];
 
@@ -109,7 +160,7 @@ class Rar15Unpacker {
   int _lCount = 0;
 
   // Output accumulator.
-  final List<int> _out = [];
+  late UnpackOutput _output;
   int _destUnpSize = 0;
 
   // Bit reader.
@@ -118,11 +169,15 @@ class Rar15Unpacker {
   /// Decompresses [packed] and returns the first [unpSize] unpacked bytes.
   ///
   /// [solid] carries the window state forward when `true` (not reset).
-  Uint8List unpack15(
-      {required Uint8List packed, required int unpSize, bool solid = false}) {
-    _inp = BitInput.external(packed);
+  UnpackResult unpack15({
+    required PaddedInput packed,
+    required UnpackOutput output,
+    required int unpSize,
+    bool solid = false,
+  }) {
+    _inp = BitInput.padded(packed);
+    _output = output;
     _destUnpSize = unpSize;
-    _out.clear();
 
     _unpInitData15(solid);
     if (!solid) {
@@ -187,8 +242,7 @@ class Rar15Unpacker {
     }
     _writeBuf();
 
-    return Uint8List.fromList(
-        _out.length > unpSize ? _out.sublist(0, unpSize) : _out);
+    return _output.finish();
   }
 
   // ---------------------------------------------------------------------------
@@ -205,8 +259,8 @@ class Rar15Unpacker {
   void _writeBuf() {
     var wp = _wrPtr;
     final up = _unpPtr & _maxWinMask;
-    while (wp != up && _out.length < _destUnpSize + 1 + _out.length) {
-      _out.add(_window[wp]);
+    while (wp != up && _output.length < _destUnpSize + 1 + _output.length) {
+      _output.addByte(_window[wp]);
       wp = (wp + 1) & _maxWinMask;
     }
     _wrPtr = wp;
@@ -217,7 +271,7 @@ class Rar15Unpacker {
     var wp = _wrPtr;
     final up = _unpPtr & _maxWinMask;
     while (wp != up) {
-      _out.add(_window[wp]);
+      _output.addByte(_window[wp]);
       wp = (wp + 1) & _maxWinMask;
     }
     _wrPtr = wp;
@@ -276,8 +330,7 @@ class Rar15Unpacker {
   // DecodeNum: decode a variable-length code using a distribution table.
   // ---------------------------------------------------------------------------
 
-  int _decodeNum(
-      int num, int startPos, List<int> decTab, List<int> posTab) {
+  int _decodeNum(int num, int startPos, List<int> decTab, List<int> posTab) {
     num &= 0xfff0;
     var i = 0;
     while (decTab[i] <= num) {
@@ -305,8 +358,7 @@ class Rar15Unpacker {
       }
     } else {
       while (length-- > 0) {
-        _window[_unpPtr] =
-            _window[(_unpPtr - distance) & _maxWinMask];
+        _window[_unpPtr] = _window[(_unpPtr - distance) & _maxWinMask];
         _unpPtr = (_unpPtr + 1) & _maxWinMask;
       }
     }
@@ -317,8 +369,7 @@ class Rar15Unpacker {
   // ---------------------------------------------------------------------------
 
   void _getFlagsBuf() {
-    final flagsPlace =
-        _decodeNum(_fgetbits(), _startHf2, _decHf2, _posHf2);
+    final flagsPlace = _decodeNum(_fgetbits(), _startHf2, _decHf2, _posHf2);
     if (flagsPlace >= _chSetC.length) return;
 
     int flags;
@@ -339,15 +390,77 @@ class Rar15Unpacker {
   // ShortLZ.
   // ---------------------------------------------------------------------------
 
-  static const List<int> _shortLen1 = [1, 3, 4, 4, 5, 6, 7, 8, 8, 4, 4, 5, 6, 6, 4, 0];
-  static const List<int> _shortXor1 = [
-    0, 0xa0, 0xd0, 0xe0, 0xf0, 0xf8, 0xfc, 0xfe,
-    0xff, 0xc0, 0x80, 0x90, 0x98, 0x9c, 0xb0, 0,
+  static const List<int> _shortLen1 = [
+    1,
+    3,
+    4,
+    4,
+    5,
+    6,
+    7,
+    8,
+    8,
+    4,
+    4,
+    5,
+    6,
+    6,
+    4,
+    0
   ];
-  static const List<int> _shortLen2 = [2, 3, 3, 3, 4, 4, 5, 6, 6, 4, 4, 5, 6, 6, 4, 0];
+  static const List<int> _shortXor1 = [
+    0,
+    0xa0,
+    0xd0,
+    0xe0,
+    0xf0,
+    0xf8,
+    0xfc,
+    0xfe,
+    0xff,
+    0xc0,
+    0x80,
+    0x90,
+    0x98,
+    0x9c,
+    0xb0,
+    0,
+  ];
+  static const List<int> _shortLen2 = [
+    2,
+    3,
+    3,
+    3,
+    4,
+    4,
+    5,
+    6,
+    6,
+    4,
+    4,
+    5,
+    6,
+    6,
+    4,
+    0
+  ];
   static const List<int> _shortXor2 = [
-    0, 0x40, 0x60, 0xa0, 0xd0, 0xe0, 0xf0, 0xf8,
-    0xfc, 0xc0, 0x80, 0x90, 0x98, 0x9c, 0xb0, 0,
+    0,
+    0x40,
+    0x60,
+    0xa0,
+    0xd0,
+    0xe0,
+    0xf0,
+    0xf8,
+    0xfc,
+    0xc0,
+    0x80,
+    0x90,
+    0x98,
+    0x9c,
+    0xb0,
+    0,
   ];
 
   int _getShortLen1(int pos) => pos == 1 ? _buf60 + 3 : _shortLen1[pos];
@@ -374,14 +487,18 @@ class Rar15Unpacker {
       for (length = 0;; length++) {
         if (((bitField ^ _shortXor1[length]) &
                 (~(0xff >> _getShortLen1(length)))) ==
-            0) { break; }
+            0) {
+          break;
+        }
       }
       _faddbits(_getShortLen1(length));
     } else {
       for (length = 0;; length++) {
         if (((bitField ^ _shortXor2[length]) &
                 (~(0xff >> _getShortLen2(length)))) ==
-            0) { break; }
+            0) {
+          break;
+        }
       }
       _faddbits(_getShortLen2(length));
     }
@@ -405,8 +522,7 @@ class Rar15Unpacker {
 
       _lCount = 0;
       final saveLength = length;
-      final distance =
-          _oldDist[(_oldDistPtr - (length - 9)) & 3];
+      final distance = _oldDist[(_oldDistPtr - (length - 9)) & 3];
       length = _decodeNum(_fgetbits(), _startL1, _decL1, _posL1) + 2;
       if (length == 0x101 && saveLength == 10) {
         _buf60 ^= 1;
@@ -478,14 +594,11 @@ class Rar15Unpacker {
 
     bitField = _fgetbits();
     if (_avrPlcB > 0x28ff) {
-      distancePlace =
-          _decodeNum(bitField, _startHf2, _decHf2, _posHf2);
+      distancePlace = _decodeNum(bitField, _startHf2, _decHf2, _posHf2);
     } else if (_avrPlcB > 0x6ff) {
-      distancePlace =
-          _decodeNum(bitField, _startHf1, _decHf1, _posHf1);
+      distancePlace = _decodeNum(bitField, _startHf1, _decHf1, _posHf1);
     } else {
-      distancePlace =
-          _decodeNum(bitField, _startHf0, _decHf0, _posHf0);
+      distancePlace = _decodeNum(bitField, _startHf0, _decHf0, _posHf0);
     }
 
     _avrPlcB += distancePlace;
@@ -516,8 +629,7 @@ class Rar15Unpacker {
     length += 3;
     if (distance >= _maxDist3) length++;
     if (distance <= 256) length += 8;
-    if (oldAvr3 > 0xb0 ||
-        (_avrPlc >= 0x2a00 && oldAvr2 < 0x40)) {
+    if (oldAvr3 > 0xb0 || (_avrPlc >= 0x2a00 && oldAvr2 < 0x40)) {
       _maxDist3 = 0x7f00;
     } else {
       _maxDist3 = 0x2001;
@@ -551,7 +663,9 @@ class Rar15Unpacker {
     bytePlace &= 0xff;
 
     if (_stMode != 0) {
-    if (bytePlace == 0 && bitField > 0xfff) { bytePlace = 0x100; }
+      if (bytePlace == 0 && bitField > 0xfff) {
+        bytePlace = 0x100;
+      }
       if (--bytePlace == -1) {
         final bf2 = _fgetbits();
         _faddbits(1);
@@ -562,8 +676,7 @@ class Rar15Unpacker {
         } else {
           final l = ((bf2 & 0x4000) != 0) ? 4 : 3;
           _faddbits(1);
-          final d =
-              _decodeNum(_fgetbits(), _startHf2, _decHf2, _posHf2);
+          final d = _decodeNum(_fgetbits(), _startHf2, _decHf2, _posHf2);
           final dist = (d << 5) | (_fgetbits() >> 11);
           _faddbits(5);
           _copyString15(dist, l);

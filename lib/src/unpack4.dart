@@ -10,9 +10,11 @@ library;
 import 'dart:typed_data';
 
 import 'bit_input.dart';
+import 'lz_copy.dart';
 import 'ppmd.dart';
 import 'rarvm.dart';
 import 'unpack5.dart';
+import 'unpack_output.dart';
 import 'unrar_error.dart';
 
 // RAR 3.x alphabets (`compress.hpp`).
@@ -40,26 +42,167 @@ const int blockLz = 0;
 const int blockPpm = 1;
 
 const List<int> _lDecode = [
-  0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 56, 64,
-  80, 96, 112, 128, 160, 192, 224,
+  0,
+  1,
+  2,
+  3,
+  4,
+  5,
+  6,
+  7,
+  8,
+  10,
+  12,
+  14,
+  16,
+  20,
+  24,
+  28,
+  32,
+  40,
+  48,
+  56,
+  64,
+  80,
+  96,
+  112,
+  128,
+  160,
+  192,
+  224,
 ];
 
 const List<int> _lBits = [
-  0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5,
-  5, 5, 5,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  0,
+  1,
+  1,
+  1,
+  1,
+  2,
+  2,
+  2,
+  2,
+  3,
+  3,
+  3,
+  3,
+  4,
+  4,
+  4,
+  4,
+  5,
+  5,
+  5,
+  5,
 ];
 
 const List<int> _dDecode20 = [
-  0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512,
-  768, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576, 32768,
-  49152, 65536, 98304, 131072, 196608, 262144, 327680, 393216, 458752, 524288,
-  589824, 655360, 720896, 786432, 851968, 917504, 983040,
+  0,
+  1,
+  2,
+  3,
+  4,
+  6,
+  8,
+  12,
+  16,
+  24,
+  32,
+  48,
+  64,
+  96,
+  128,
+  192,
+  256,
+  384,
+  512,
+  768,
+  1024,
+  1536,
+  2048,
+  3072,
+  4096,
+  6144,
+  8192,
+  12288,
+  16384,
+  24576,
+  32768,
+  49152,
+  65536,
+  98304,
+  131072,
+  196608,
+  262144,
+  327680,
+  393216,
+  458752,
+  524288,
+  589824,
+  655360,
+  720896,
+  786432,
+  851968,
+  917504,
+  983040,
 ];
 
 const List<int> _dBits20 = [
-  0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10,
-  11, 11, 12, 12, 13, 13, 14, 14, 15, 15, 16, 16, 16, 16, 16, 16, 16, 16, 16,
-  16, 16, 16, 16, 16,
+  0,
+  0,
+  0,
+  0,
+  1,
+  1,
+  2,
+  2,
+  3,
+  3,
+  4,
+  4,
+  5,
+  5,
+  6,
+  6,
+  7,
+  7,
+  8,
+  8,
+  9,
+  9,
+  10,
+  10,
+  11,
+  11,
+  12,
+  12,
+  13,
+  13,
+  14,
+  14,
+  15,
+  15,
+  16,
+  16,
+  16,
+  16,
+  16,
+  16,
+  16,
+  16,
+  16,
+  16,
+  16,
+  16,
+  16,
+  16,
 ];
 
 const List<int> _sdDecode = [0, 4, 8, 16, 32, 64, 128, 192];
@@ -67,7 +210,27 @@ const List<int> _sdBits = [2, 2, 3, 4, 5, 6, 6, 6];
 
 /// `DBitLengthCounts` driving the one-time build of `DDecode`/`DBits` for
 /// RAR 3.x distances.
-const List<int> _dBitLengthCounts29 = [4, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 14, 0, 12];
+const List<int> _dBitLengthCounts29 = [
+  4,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  2,
+  14,
+  0,
+  12
+];
 
 /// Audio prediction variables for one channel (`AudioVariables`).
 class _AudioVariables {
@@ -99,6 +262,7 @@ class Rar4Unpacker {
   Uint8List? _window;
   int _maxWinSize = 0;
   int _maxWinMask = 0;
+  int _totalUnpSize = 0;
 
   // Shared Huffman tables (LD/DD/LDD/RD/BD for v29, LD/DD/RD/BD for v20).
   final _ld = DecodeTable();
@@ -148,23 +312,26 @@ class Rar4Unpacker {
   int _destUnpSize = 0;
   int _writtenFileSize = 0;
   int _packedLength = 0;
-  final _output = BytesBuilder();
+  late UnpackOutput _output;
 
   /// Unpacks [packed] into a new byte buffer of [unpSize] bytes.
   ///
   /// [solid] marks a file continuing a solid stream; the window and match
   /// history of the previous file are reused. [unpVer] selects the RAR 4.x
   /// algorithm (20/26 = RAR 2.x, 29 = RAR 3.x). Returns the unpacked bytes.
-  Uint8List unpack4({
-    required Uint8List packed,
+  UnpackResult unpack4({
+    required PaddedInput packed,
+    required UnpackOutput output,
     required int unpSize,
     required int windowSize,
     required bool solid,
     required int unpVer,
   }) {
-    _inp = BitInput.external(packed);
+    _inp = BitInput.padded(packed);
+    _output = output;
     _packedLength = packed.length;
     _destUnpSize = unpSize;
+    _totalUnpSize = unpSize;
     _initWin(windowSize, solid);
     switch (unpVer) {
       case 20:
@@ -177,7 +344,7 @@ class Rar4Unpacker {
       default:
         throw UnrarException('Unsupported RAR 4.x unpVer $unpVer');
     }
-    return _output.takeBytes();
+    return _output.finish();
   }
 
   /// Mirrors `Unpack::Init` for the RAR 4.x path. RAR 4 window sizes are
@@ -244,8 +411,6 @@ class Rar4Unpacker {
     _readBorder = 0;
   }
 
-  int _wrapUp(int pos) => pos >= _maxWinSize ? pos - _maxWinSize : pos;
-
   /// Mirrors `Unpack::UnpReadBuf`/`UnpReadBuf30` in the external-buffer mode:
   /// the whole packed stream is already in memory, so there is nothing to
   /// read or relocate, only the EOF and border accounting is kept.
@@ -268,7 +433,7 @@ class Rar4Unpacker {
       writeSize = leftToWrite;
     }
     if (writeSize > 0) {
-      _output.add(data.sublist(0, writeSize));
+      _output.add(data, 0, writeSize);
     }
     _writtenFileSize += size;
   }
@@ -277,8 +442,7 @@ class Rar4Unpacker {
   void _unpWriteArea(int startPtr, int endPtr) {
     final window = _window!;
     if (endPtr < startPtr) {
-      _unpWriteData(
-          Uint8List.sublistView(window, startPtr, _maxWinSize),
+      _unpWriteData(Uint8List.sublistView(window, startPtr, _maxWinSize),
           _maxWinSize - startPtr);
       _unpWriteData(Uint8List.sublistView(window, 0, endPtr), endPtr);
     } else {
@@ -287,17 +451,35 @@ class Rar4Unpacker {
     }
   }
 
-  /// Mirrors `Unpack::UnpWriteBuf20`. Writes the window segment between
-  /// [WrPtr] and [UnpPtr], wrapping around the window end.
+  /// Mirrors `Unpack::UnpWriteBuf20`. Unlike the v29/v30 paths, the C v20
+  /// write routine targets `UnpIO->UnpWrite` directly and is NOT gated on
+  /// `DestUnpSize`, because by the time the final flush happens after the
+  /// v20 loop the remaining size has already been decremented to -1. The
+  /// loop guarantees exactly `unpSize` output positions were produced, so we
+  /// only cap against the original destination size to avoid overrun on
+  /// malformed or solid streams.
   void _unpWriteBuf20() {
     final window = _window!;
-    if (_unpPtr < _wrPtr) {
-      _unpWriteData(Uint8List.sublistView(window, _wrPtr, _maxWinSize),
-          _maxWinSize - _wrPtr);
-      _unpWriteData(Uint8List.sublistView(window, 0, _unpPtr), _unpPtr);
-    } else {
-      _unpWriteData(
-          Uint8List.sublistView(window, _wrPtr, _unpPtr), _unpPtr - _wrPtr);
+    var writeSize = _unpPtr < _wrPtr
+        ? (_maxWinSize - _wrPtr) + _unpPtr
+        : (_unpPtr - _wrPtr);
+    final leftToWrite = _totalUnpSize - _writtenFileSize;
+    if (writeSize > leftToWrite) {
+      writeSize = leftToWrite;
+    }
+    if (writeSize > 0) {
+      if (_unpPtr < _wrPtr) {
+        final firstPart = _maxWinSize - _wrPtr;
+        if (writeSize <= firstPart) {
+          _output.add(window, _wrPtr, writeSize);
+        } else {
+          _output.add(window, _wrPtr, firstPart);
+          _output.add(window, 0, writeSize - firstPart);
+        }
+      } else {
+        _output.add(window, _wrPtr, writeSize);
+      }
+      _writtenFileSize += writeSize;
     }
     _wrPtr = _unpPtr;
   }
@@ -402,41 +584,15 @@ class Rar4Unpacker {
   /// Mirrors `Unpack::CopyString`. A byte-wise forward copy matches the C
   /// `UNPACK_COPY8` behavior for overlapping and non-overlapping strings.
   void _copyString(int length, int distance) {
-    final window = _window!;
-    var srcPtr = _unpPtr - distance;
-
-    if (distance > _unpPtr) {
-      // Same as WrapDown(SrcPtr), needed because of UnpPtr-Distance above.
-      srcPtr += _maxWinSize;
-
-      // Zero-fill the match area for distances beyond the window or before
-      // the first window has been filled, like the C code, so corrupt data
-      // does not depend on previously extracted files.
-      if (distance > _maxWinSize || !_firstWinDone) {
-        while (length-- > 0) {
-          window[_unpPtr] = 0;
-          _unpPtr = _wrapUp(_unpPtr + 1);
-        }
-        return;
-      }
-    }
-
-    if (srcPtr < _maxWinSize - maxIncLzMatch &&
-        _unpPtr < _maxWinSize - maxIncLzMatch) {
-      // Fast path: nowhere near the window borders, no wrap checks needed.
-      var src = srcPtr;
-      var dest = _unpPtr;
-      _unpPtr += length;
-      while (length-- > 0) {
-        window[dest++] = window[src++];
-      }
-    } else {
-      // Slow path with all possible precautions.
-      while (length-- > 0) {
-        window[_unpPtr] = window[_wrapUp(srcPtr++)];
-        _unpPtr = _wrapUp(_unpPtr + 1);
-      }
-    }
+    _unpPtr = copyLzMatch(
+      window: _window!,
+      destination: _unpPtr,
+      length: length,
+      distance: distance,
+      windowSize: _maxWinSize,
+      firstWindowDone: _firstWinDone,
+      endMargin: maxIncLzMatch,
+    );
   }
 
   /// Mirrors `Unpack::CopyString20`.
@@ -903,7 +1059,8 @@ class Rar4Unpacker {
     }
     makeDecodeTables(table.sublist(0, nc30), _ld, nc30);
     makeDecodeTables(table.sublist(nc30, nc30 + dc30), _dd, dc30);
-    makeDecodeTables(table.sublist(nc30 + dc30, nc30 + dc30 + ldc30), _ldd, ldc30);
+    makeDecodeTables(
+        table.sublist(nc30 + dc30, nc30 + dc30 + ldc30), _ldd, ldc30);
     makeDecodeTables(table.sublist(nc30 + dc30 + ldc30), _rd, rc30);
     _unpOldTable.setRange(0, huffTableSize30, table);
     return true;
@@ -984,8 +1141,7 @@ class Rar4Unpacker {
     }
     if (_unpAudioBlock) {
       for (var i = 0; i < _unpChannels; i++) {
-        makeDecodeTables(
-            table.sublist(i * mc20, (i + 1) * mc20), _md[i], mc20);
+        makeDecodeTables(table.sublist(i * mc20, (i + 1) * mc20), _md[i], mc20);
       }
     } else {
       makeDecodeTables(table.sublist(0, nc20), _ld, nc20);
@@ -1018,12 +1174,13 @@ class Rar4Unpacker {
     v.d2 = v.lastDelta - v.d1;
     v.d1 = v.lastDelta;
     final pch = (8 * v.lastChar +
-            v.k1 * v.d1 +
-            v.k2 * v.d2 +
-            v.k3 * v.d3 +
-            v.k4 * v.d4 +
-            v.k5 * _unpChannelDelta) >>
-        3 & 0xff;
+                v.k1 * v.d1 +
+                v.k2 * v.d2 +
+                v.k3 * v.d3 +
+                v.k4 * v.d4 +
+                v.k5 * _unpChannelDelta) >>
+            3 &
+        0xff;
 
     final ch = (pch - delta) & 0xff;
 
@@ -1258,9 +1415,8 @@ class Rar4Unpacker {
       stackFilter.blockLength = RarVm.readData(vmCodeInp);
       _oldFilterLengths[filtPos] = stackFilter.blockLength;
     } else {
-      stackFilter.blockLength = filtPos < _oldFilterLengths.length
-          ? _oldFilterLengths[filtPos]
-          : 0;
+      stackFilter.blockLength =
+          filtPos < _oldFilterLengths.length ? _oldFilterLengths[filtPos] : 0;
     }
 
     stackFilter.nextWindow =
@@ -1332,7 +1488,9 @@ void _initDDecode29() {
     var bitLength = 0;
     var slot = 0;
     for (var i = 0; i < _dBitLengthCounts29.length; i++, bitLength++) {
-      for (var j = 0; j < _dBitLengthCounts29[i]; j++, slot++, dist += (1 << bitLength)) {
+      for (var j = 0;
+          j < _dBitLengthCounts29[i];
+          j++, slot++, dist += (1 << bitLength)) {
         _dDecode29[slot] = dist;
         _dBits29[slot] = bitLength;
       }

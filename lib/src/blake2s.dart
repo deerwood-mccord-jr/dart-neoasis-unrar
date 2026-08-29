@@ -205,9 +205,9 @@ class Blake2Sp {
   int _buflen = 0;
 
   /// Feeds [data] into the tree hash.
-  void update(List<int> data) {
-    var inPos = 0;
-    var inLen = data.length;
+  void update(List<int> data, [int offset = 0, int? length]) {
+    var inPos = offset;
+    var inLen = length ?? data.length - offset;
     var left = _buflen;
     final fill = _buf.length - left;
     if (left != 0 && inLen >= fill) {
