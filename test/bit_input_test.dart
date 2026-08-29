@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:neoasis_unrar/src/bit_input.dart';
 import 'package:neoasis_unrar/src/raw_int.dart';
 import 'package:test/test.dart';
@@ -60,6 +62,27 @@ void main() {
       bi.buffer[0] = 1;
       expect(bi.overflow(0x8000), isTrue);
       expect(bi.overflow(0x7FFF), isFalse);
+    });
+
+    test('padded input does not copy caller-owned storage', () {
+      final storage = Uint8List(PaddedInput.paddingSize + 2)
+        ..[0] = 0x12
+        ..[1] = 0x34;
+      final input = PaddedInput(storage, 2);
+      final bi = BitInput.padded(input);
+
+      expect(bi.getbits(), 0x1234);
+      storage[0] = 0xab;
+      expect(bi.getbits(), 0xab34);
+    });
+
+    test('padded input safely supports look-ahead at logical end', () {
+      final input = PaddedInput.copyOf(Uint8List.fromList([0xff]));
+      final bi = BitInput.padded(input)..addbits(8);
+
+      expect(bi.getbits(), 0);
+      expect(bi.getbits32(), 0);
+      expect(bi.getbits64(), 0);
     });
   });
 

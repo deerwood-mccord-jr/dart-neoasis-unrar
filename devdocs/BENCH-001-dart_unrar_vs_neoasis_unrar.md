@@ -260,3 +260,41 @@ on a NAS (Vagabond Volume 01) instead.
   via isolate worker pools doing extract-to-memory + thumbnail generation —
   recovers that single-core difference several times over, and is the only
   path available on web/Wasm.
+
+## 9. IMPL-0001 optimization pass — 2026-08-29
+
+The implementation removed redundant packed/output copies, made archive test
+mode discard payload bytes while retaining integrity checks, optimized LZ
+match replication, reduced header and AES allocation, reused RAR5 KDF results,
+and adopted slicing-by-8 CRC32. No public API changed.
+
+### Focused JIT result: `rar4_vmfilter_chain.rar`
+
+Median microseconds on the same host and harness. The baseline used 12 measured
+iterations; the final column uses the more stable 30-iteration final run.
+
+| op | before | after | delta |
+|---|---:|---:|---:|
+| list | 340 | 272 | -20.0% |
+| extract_all | 3,369 | 2,599 | -22.9% |
+| extract_one | 2,727 | 2,413 | -11.5% |
+| test | 3,424 | 2,452 | -28.4% |
+
+The final JIT run reached 131.8 MiB/s for extract-all and 139.7 MiB/s for
+test. In the final AOT CLI bundle, neoasis measured 3,122 µs extract-all and
+2,632 µs extract-one versus 3,365 µs and 2,671 µs for the native wrapper.
+
+### Correctness and coverage
+
+- `dart analyze`: clean.
+- `dart test`: 171 passed, 2 environment-dependent volume-reference tests
+  skipped.
+- `rar6 6.12 -ma4 -m5` generated a RAR 4/v29 archive; current `rar 7.23 -m5`
+  generated RAR 5/v50. `xcheck.dart` reported 6/6 byte-identical files for
+  each archive.
+- All committed RAR 1.4, RAR 3.x VM-filter, RAR 5/7, solid, encrypted,
+  BLAKE2sp, and multi-volume tests passed.
+
+The original 102-entry `bench_rar5.rar` / `bench_store.rar` corpus and the
+Vagabond archive were unavailable during this pass. Their historical rows
+above are retained, and their final rerun remains an external-corpus follow-up.

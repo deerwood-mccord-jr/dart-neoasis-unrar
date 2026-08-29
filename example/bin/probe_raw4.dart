@@ -2,7 +2,9 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:neoasis_unrar/src/crc.dart';
+import 'package:neoasis_unrar/src/bit_input.dart';
 import 'package:neoasis_unrar/src/unpack4.dart';
+import 'package:neoasis_unrar/src/unpack_output.dart';
 
 Future<void> main(List<String> args) async {
   for (final path in args) {
@@ -12,16 +14,19 @@ Future<void> main(List<String> args) async {
     final rar4 = Rar4Unpacker();
     for (final e in entries) {
       final out = rar4.unpack4(
-        packed: bytes.sublist(e.offset, e.offset + e.packSize),
+        packed: PaddedInput.copyOf(
+            Uint8List.sublistView(bytes, e.offset, e.offset + e.packSize)),
+        output: UnpackOutput(expectedSize: e.unpSize, collect: true),
         unpSize: e.unpSize,
         windowSize: e.windowSize,
         solid: false,
         unpVer: e.unpVer,
       );
+      final data = out.bytes ?? Uint8List(0);
       stdout.writeln(
-          '  ${e.name}: out=${out.length} crc=${crc32Of(out).toRadixString(16)}'
+          '  ${e.name}: out=${data.length} crc=${crc32Of(data).toRadixString(16)}'
           ' want=${e.crc32.toRadixString(16)}'
-          ' all=${out.toList()}');
+          ' all=${data.toList()}');
     }
   }
 }
@@ -57,8 +62,7 @@ List<_Entry> _parse(Uint8List b) {
       final dataOffset = pos + headSize;
       final isDir = (flags & 0x0400) != 0;
       final win = isDir ? 0 : 0x10000 << ((flags >> 5) & 0x7);
-      out.add(
-          _Entry('', packSize, unpSize, unpVer, win, fileCrc, dataOffset));
+      out.add(_Entry('', packSize, unpSize, unpVer, win, fileCrc, dataOffset));
       pos += headSize + packSize;
       continue;
     }

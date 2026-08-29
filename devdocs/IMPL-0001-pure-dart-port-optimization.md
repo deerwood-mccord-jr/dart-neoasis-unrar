@@ -2,12 +2,38 @@
 
 | | |
 |---|---|
-| Status | **Planned** — implementation not started |
+| Status | **Implemented** — available-corpus gates green; Vagabond rerun pending corpus availability |
 | Date | 2026-08-29 |
 | Owner | next engineer/agent working on `neoasis_unrar` throughput |
 | Related | `HANDOFF-001-optimization-of-the-port.md`, `BENCH-001-dart_unrar_vs_neoasis_unrar.md`, `GAP-001-neoasis_unrar_vs_unrar_cplusplus.md` |
 | Reference | `../dart_unrar/third_party/unrar/` |
 | Goal | Reduce avoidable allocation, copying, hashing, and header-I/O overhead while preserving byte-identical behavior across RAR 1.4 through RAR 7.0 |
+
+---
+
+## Execution record
+
+Implemented on 2026-08-29. Retained changes include padded packed input,
+exact/discard output sinks, incremental CRC/Checksum14/BLAKE2sp, optimized LZ
+match replication, contiguous header buffers, cached file position/length,
+per-reader RAR5 KDF reuse, allocation-reduced AES-CBC, and slicing-by-8 CRC32.
+
+The persistent bit-reservoir experiment was not started: phase 8 explicitly
+requires a post-change profile showing bit loading remains a leading hotspot,
+and the available end-to-end measurements justified retaining the earlier
+phases without introducing that higher-risk decoder-state change.
+
+Validation completed with `dart analyze` and the full 171-test suite. Archives
+created locally with `rar6 -ma4` (RAR 4/v29) and current `rar` (RAR 5/v50)
+cross-checked byte-identically with `xcheck.dart` (6/6 files each). The
+Vagabond archive and the original 102-entry benchmark archives were not present
+on this machine, so their acceptance rows remain to be rerun when restored.
+
+On `rar4_vmfilter_chain.rar`, the more stable 30-iteration JIT run measured
+272/2599/2413/2452 µs for list/extract-all/extract-one/test. The AOT CLI bundle
+measured 1209/3122/2632/3115 µs; pure Dart was faster than the native wrapper
+for extract-all and extract-one in that AOT run. Full detail is recorded in
+`BENCH-001-dart_unrar_vs_neoasis_unrar.md`.
 
 ---
 

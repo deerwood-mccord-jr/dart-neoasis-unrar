@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | **Work queue** — no item below is started |
+| Status | **Superseded** — executed by `IMPL-0001-pure-dart-port-optimization.md` |
 | Date | 2026-08-28 |
 | Owner | next engineer/agent working on neoasis_unrar throughput |
 | Related | `BENCH-001-dart_unrar_vs_neoasis_unrar.md`, `ISSUE-001-Vagabond-RAR2-zero-byte-unpack.md`, `GAP-001-neoasis_unrar_vs_unrar_cplusplus.md` |

@@ -33,7 +33,7 @@ class MemoryByteSource implements ByteSource {
       return Uint8List(0);
     }
     final end = (_pos + length).clamp(0, _bytes.length);
-    final result = Uint8List.fromList(_bytes.sublist(_pos, end));
+    final result = Uint8List.sublistView(_bytes, _pos, end);
     _pos = end;
     return result;
   }

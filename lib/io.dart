@@ -16,6 +16,8 @@ class FileByteSource implements ByteSource {
 
   final File _file;
   RandomAccessFile? _raf;
+  int _position = 0;
+  int? _length;
 
   Future<RandomAccessFile> _open() async {
     _raf ??= await _file.open(mode: FileMode.read);
@@ -25,28 +27,29 @@ class FileByteSource implements ByteSource {
   @override
   Future<Uint8List> read(int length) async {
     final raf = await _open();
-    return raf.read(length);
+    final bytes = await raf.read(length);
+    _position += bytes.length;
+    return bytes;
   }
 
   @override
   Future<void> seek(int position) async {
     final raf = await _open();
     await raf.setPosition(position);
+    _position = position;
   }
 
   @override
-  Future<int> position() async {
-    final raf = await _open();
-    return raf.position();
-  }
+  Future<int> position() async => _position;
 
   @override
-  Future<int> length() async => _file.length();
+  Future<int> length() async => _length ??= await _file.length();
 
   @override
   Future<void> close() async {
     await _raf?.close();
     _raf = null;
+    _position = 0;
   }
 }
 
@@ -82,8 +85,7 @@ Future<RarArchive> openRarFile(
   bool autoVolume = true,
   VolumeResolver? volumeResolver,
 }) {
-  final resolver =
-      volumeResolver ?? (autoVolume ? fileVolumeResolver() : null);
+  final resolver = volumeResolver ?? (autoVolume ? fileVolumeResolver() : null);
   return RarArchive.open(
     FileByteSource(File(path)),
     password: password,
@@ -204,4 +206,3 @@ Future<List<String>> restoreRevArchive(
     }
   }
 }
-

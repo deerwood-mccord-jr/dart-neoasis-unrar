@@ -19,7 +19,6 @@ import 'unpacker.dart';
 import 'unrar_error.dart';
 import 'volume.dart';
 
-
 /// A single parsed block header, mirroring the fields used by the C code's
 /// `BaseBlock`/`BlockHeader` structs.
 class _BlockHeader {
@@ -265,14 +264,20 @@ class ArchiveReader {
     return entries;
   }
 
-  Future<void> close() => _source.close();
+  Future<void> close() async {
+    _unpacker.clearSensitiveState();
+    _rar3HeaderDecryptor = null;
+    _rar5HeaderDecryptor = null;
+    await _source.close();
+  }
 
   /// Extracts every file entry in archive order, invoking [onFile] with each
   /// entry and its fully unpacked, CRC-verified bytes. Directories and
   /// service blocks are skipped. Throws [UnsupportedMethodException] for
   /// unsupported compression methods and [UnrarException] on CRC mismatches.
   Future<void> extractAll(
-      FutureOr<void> Function(ArchiveEntry entry, Uint8List data) onFile) async {
+      FutureOr<void> Function(ArchiveEntry entry, Uint8List data)
+          onFile) async {
     if (!_initialized) {
       await init();
     } else {
@@ -330,17 +335,27 @@ class ArchiveReader {
   /// `true` when all checks pass. Throws [UnsupportedMethodException] if any
   /// entry uses a compression method that cannot be verified yet.
   Future<bool> testArchive() async {
-    var ok = true;
-    await extractAll((entry, data) {
-      // CRC verification happens inside extractAll's unpack path.
-    });
-    if (_brokenHeader) {
-      ok = false;
+    if (!_initialized) {
+      await init();
+    } else {
+      await _rewind();
     }
-    return ok;
+    while (true) {
+      final head = await _readHeader();
+      if (head == null || head.type == HeaderType.headEndArc) {
+        break;
+      }
+      final entry = head.entry;
+      if (entry != null && !entry.isDirectory) {
+        await _unpackEntry(entry, head, collectOutput: false);
+      }
+      await _seekToNext();
+    }
+    return !_brokenHeader;
   }
 
-  Future<Uint8List> _unpackEntry(ArchiveEntry entry, _BlockHeader head) async {
+  Future<Uint8List> _unpackEntry(ArchiveEntry entry, _BlockHeader head,
+      {bool collectOutput = true}) async {
     // FSREDIR_FILECOPY and FSREDIR_HARDLINK: resolve the source entry.
     // Both reference a file already in the archive and have no data area of
     // their own. Mirrors `ExtractFileCopy` / `ExtractHardlink` in extract.cpp.
@@ -378,7 +393,7 @@ class ArchiveReader {
           'Entry starts in a preceding volume; open the first part');
     }
     if (entry.splitAfter) {
-      return _unpackSplit(entry, head);
+      return _unpackSplit(entry, head, collectOutput: collectOutput);
     }
     // For RAR 1.4 entries the crc32 field holds a 16-bit Checksum14 value.
     // Pass expectedCrc=0 to suppress the CRC32 check inside the unpacker,
@@ -400,6 +415,9 @@ class ArchiveReader {
       cryptInfo: entry.cryptInfo,
       hashType: entry.hashType,
       blake2Digest: entry.blake2Digest,
+      // RAR 1.4 checksum verification below still requires the bytes. Other
+      // formats verify incrementally in the unpack output sink.
+      collectOutput: collectOutput || isRar14,
     );
 
     if (isRar14 && entry.crc32 != 0) {
@@ -418,7 +436,8 @@ class ArchiveReader {
   /// decompresses/verifies the concatenated stream. Mirrors the `MergeArchive`
   /// / `UnpPackedLeft` continuation logic in `volume.cpp`.
   Future<Uint8List> _unpackSplit(
-      ArchiveEntry firstEntry, _BlockHeader firstHead) async {
+      ArchiveEntry firstEntry, _BlockHeader firstHead,
+      {bool collectOutput = true}) async {
     final resolver = _volumeResolver;
     final arcName = _archiveName;
     if (resolver == null || arcName == null) {
@@ -443,8 +462,7 @@ class ArchiveReader {
       final nextName = nextVolumeName(currentArcName, oldNumbering: rar4Old);
       final nextSource = await resolver(currentArcName, nextName);
       if (nextSource == null) {
-        throw UnrarException(
-            'Cannot locate next volume: $nextName');
+        throw UnrarException('Cannot locate next volume: $nextName');
       }
 
       // Open a temporary reader for the next volume, passing through the
@@ -535,6 +553,7 @@ class ArchiveReader {
       alreadyDecrypted: true,
       hashType: firstEntry.hashType,
       blake2Digest: firstEntry.blake2Digest,
+      collectOutput: collectOutput,
     );
   }
 
@@ -553,15 +572,19 @@ class ArchiveReader {
   Future<void> _seekToNext() => _source.seek(_nextBlockPos);
 
   Future<Uint8List> _readExact(int size) async {
-    final buffer = <int>[];
-    while (buffer.length < size) {
-      final chunk = await _source.read(size - buffer.length);
+    final buffer = Uint8List(size);
+    var written = 0;
+    while (written < size) {
+      final chunk = await _source.read(size - written);
       if (chunk.isEmpty) {
         break;
       }
-      buffer.addAll(chunk);
+      final copyLength =
+          chunk.length > size - written ? size - written : chunk.length;
+      buffer.setRange(written, written + copyLength, chunk);
+      written += copyLength;
     }
-    return Uint8List.fromList(buffer);
+    return written == size ? buffer : Uint8List.sublistView(buffer, 0, written);
   }
 
   Future<_BlockHeader?> _readHeader() async {
@@ -633,7 +656,8 @@ class ArchiveReader {
     final checksum = raw[8] | (raw[9] << 8);
     final headSize = raw[10] | (raw[11] << 8);
     if (headSize < minSize) return null;
-    final fileTime = raw[12] | (raw[13] << 8) | (raw[14] << 16) | (raw[15] << 24);
+    final fileTime =
+        raw[12] | (raw[13] << 8) | (raw[14] << 16) | (raw[15] << 24);
     final fileAttr = raw[16];
     final flags14 = raw[17];
     final unpVerByte = raw[18];
@@ -709,7 +733,8 @@ class ArchiveReader {
           AesCbcDecryptor(Aes.withKey(Uint8List.fromList(kdf.key)), kdf.init);
     }
 
-    final raw = RawReader(_source, decryptor: needsDecrypt ? _rar3HeaderDecryptor : null);
+    final raw = RawReader(_source,
+        decryptor: needsDecrypt ? _rar3HeaderDecryptor : null);
     if (await raw.read(sizofShortBlockHead) == 0) {
       return null;
     }
@@ -793,8 +818,7 @@ class ArchiveReader {
           await _source.seek(head.dataOffset);
           final targetBytes = await _readExact(head.dataSize);
           final end = targetBytes.indexOf(0);
-          final slice =
-              end == -1 ? targetBytes : targetBytes.sublist(0, end);
+          final slice = end == -1 ? targetBytes : targetBytes.sublist(0, end);
           // Target path is stored as bytes in the host locale; UTF-8 on Unix.
           final target = utf8.decode(slice, allowMalformed: true);
           head.entry = ArchiveEntry(
@@ -838,7 +862,9 @@ class ArchiveReader {
         final earcDataCrc = (head.flags & 0x0002) != 0;
         if (earcDataCrc) raw.skip(4); // 4-byte archive CRC (ignored).
         final earcRevSp = (head.flags & earcRevSpace) != 0;
-        if ((head.flags & earcVolNumber) != 0) raw.skip(2); // 2-byte volume number.
+        if ((head.flags & earcVolNumber) != 0) {
+          raw.skip(2); // 2-byte volume number.
+        }
         head.isLastVolume = !earcNextVol;
         head.hasRevSpace = earcRevSp;
         break;
@@ -884,8 +910,8 @@ class ArchiveReader {
     if (head.headCrc != headerCrc) {
       // AV and signature blocks have unreliable CRCs (intentional in the C
       // source — arcread.cpp:520-521); do not mark the archive as broken.
-      final crcNotReliable = head.type == HeaderType.head3Av ||
-          head.type == HeaderType.head3Sign;
+      final crcNotReliable =
+          head.type == HeaderType.head3Av || head.type == HeaderType.head3Sign;
 
       // Mirror arcread.cpp:524-547: if the end-of-archive header has
       // EARC_REVSPACE set, the last 7 bytes of the file may have been
@@ -1263,7 +1289,8 @@ class ArchiveReader {
     }
   }
 
-  void _parseMainHeader50(RawReader raw) {    _info.reset();
+  void _parseMainHeader50(RawReader raw) {
+    _info.reset();
     final arcFlags = raw.getV();
     _info.volume = (arcFlags & mhflVolume) != 0;
     _info.solid = (arcFlags & mhflSolid) != 0;
@@ -1339,9 +1366,8 @@ class ArchiveReader {
           0x20000 << ((compInfo >> 10) & (unpVerRaw == 0 ? 0x0f : 0x1f));
     }
 
-    final extra50 = extraSize != 0
-        ? _processExtra50(raw, extraSize, head.headSize)
-        : null;
+    final extra50 =
+        extraSize != 0 ? _processExtra50(raw, extraSize, head.headSize) : null;
     final cryptInfo = extra50?.cryptInfo;
     final isEncrypted = cryptInfo != null;
 
@@ -1513,15 +1539,21 @@ class ArchiveReader {
     if (isUnix && (flags & fhExtraHtimeUnixNs) != 0) {
       if (mtime != null) {
         final ns = raw.get4() & 0x3fffffff;
-        if (ns < 1000000000) mtime = mtime.add(Duration(microseconds: ns ~/ 1000));
+        if (ns < 1000000000) {
+          mtime = mtime.add(Duration(microseconds: ns ~/ 1000));
+        }
       }
       if (ctime != null) {
         final ns = raw.get4() & 0x3fffffff;
-        if (ns < 1000000000) ctime = ctime.add(Duration(microseconds: ns ~/ 1000));
+        if (ns < 1000000000) {
+          ctime = ctime.add(Duration(microseconds: ns ~/ 1000));
+        }
       }
       if (atime != null) {
         final ns = raw.get4() & 0x3fffffff;
-        if (ns < 1000000000) atime = atime.add(Duration(microseconds: ns ~/ 1000));
+        if (ns < 1000000000) {
+          atime = atime.add(Duration(microseconds: ns ~/ 1000));
+        }
       }
     }
     return _TimesResult(mtime: mtime, ctime: ctime, atime: atime);
@@ -1532,9 +1564,9 @@ class ArchiveReader {
   _RedirResult? _parseFhExtraRedir(RawReader raw, int fieldEnd) {
     final typeV = raw.getV();
     if (typeV < 0 || typeV > FileSystemRedirect.values.length) return null;
-    final redirectType = FileSystemRedirect.values
-        .firstWhere((e) => e.value == typeV,
-            orElse: () => FileSystemRedirect.fsRedirNone);
+    final redirectType = FileSystemRedirect.values.firstWhere(
+        (e) => e.value == typeV,
+        orElse: () => FileSystemRedirect.fsRedirNone);
     final flags = raw.getV();
     final isDir = (flags & fhExtraRedirDir) != 0;
     final nameSize = raw.getV();
@@ -1558,10 +1590,16 @@ class ArchiveReader {
       final len = raw.getV();
       groupName = String.fromCharCodes(raw.getB(len));
     }
-    if ((flags & fhExtraUownerNumUid) != 0) { ownerId = raw.getV(); }
-    if ((flags & fhExtraUownerNumGid) != 0) { groupId = raw.getV(); }
-    if (ownerName == null && groupName == null &&
-        ownerId == null && groupId == null) {
+    if ((flags & fhExtraUownerNumUid) != 0) {
+      ownerId = raw.getV();
+    }
+    if ((flags & fhExtraUownerNumGid) != 0) {
+      groupId = raw.getV();
+    }
+    if (ownerName == null &&
+        groupName == null &&
+        ownerId == null &&
+        groupId == null) {
       return null;
     }
     return UnixOwnerInfo(
@@ -1577,12 +1615,17 @@ class ArchiveReader {
   // ---------------------------------------------------------------------
   RarFormat _isSignature(List<int> d, int offset, int size) {
     if (size >= 1 && d[offset] == 0x52) {
-      if (size >= 4 && d[offset + 1] == 0x45 &&
-          d[offset + 2] == 0x7e && d[offset + 3] == 0x5e) {
+      if (size >= 4 &&
+          d[offset + 1] == 0x45 &&
+          d[offset + 2] == 0x7e &&
+          d[offset + 3] == 0x5e) {
         return RarFormat.rarFmt14;
       }
-      if (size >= 7 && d[offset + 1] == 0x61 && d[offset + 2] == 0x72 &&
-          d[offset + 3] == 0x21 && d[offset + 4] == 0x1a &&
+      if (size >= 7 &&
+          d[offset + 1] == 0x61 &&
+          d[offset + 2] == 0x72 &&
+          d[offset + 3] == 0x21 &&
+          d[offset + 4] == 0x1a &&
           d[offset + 5] == 0x07) {
         final b6 = d[offset + 6];
         if (b6 == 0) {
@@ -1706,37 +1749,64 @@ class _Extra50Result {
   final List<int>? blake2Digest;
 
   _Extra50Result withCrypt(CryptInfo c) => _Extra50Result(
-      cryptInfo: c, mtime: mtime, ctime: ctime, atime: atime,
-      redirectType: redirectType, redirectTarget: redirectTarget,
-      redirectTargetIsDir: redirectTargetIsDir, unixOwner: unixOwner,
-      hashType: hashType, blake2Digest: blake2Digest);
+      cryptInfo: c,
+      mtime: mtime,
+      ctime: ctime,
+      atime: atime,
+      redirectType: redirectType,
+      redirectTarget: redirectTarget,
+      redirectTargetIsDir: redirectTargetIsDir,
+      unixOwner: unixOwner,
+      hashType: hashType,
+      blake2Digest: blake2Digest);
 
   _Extra50Result withTimes(_TimesResult t) => _Extra50Result(
       cryptInfo: cryptInfo,
       mtime: t.mtime ?? mtime,
       ctime: t.ctime ?? ctime,
       atime: t.atime ?? atime,
-      redirectType: redirectType, redirectTarget: redirectTarget,
-      redirectTargetIsDir: redirectTargetIsDir, unixOwner: unixOwner,
-      hashType: hashType, blake2Digest: blake2Digest);
+      redirectType: redirectType,
+      redirectTarget: redirectTarget,
+      redirectTargetIsDir: redirectTargetIsDir,
+      unixOwner: unixOwner,
+      hashType: hashType,
+      blake2Digest: blake2Digest);
 
   _Extra50Result withRedir(_RedirResult r) => _Extra50Result(
-      cryptInfo: cryptInfo, mtime: mtime, ctime: ctime, atime: atime,
-      redirectType: r.type, redirectTarget: r.target,
-      redirectTargetIsDir: r.isDir, unixOwner: unixOwner,
-      hashType: hashType, blake2Digest: blake2Digest);
+      cryptInfo: cryptInfo,
+      mtime: mtime,
+      ctime: ctime,
+      atime: atime,
+      redirectType: r.type,
+      redirectTarget: r.target,
+      redirectTargetIsDir: r.isDir,
+      unixOwner: unixOwner,
+      hashType: hashType,
+      blake2Digest: blake2Digest);
 
   _Extra50Result withOwner(UnixOwnerInfo o) => _Extra50Result(
-      cryptInfo: cryptInfo, mtime: mtime, ctime: ctime, atime: atime,
-      redirectType: redirectType, redirectTarget: redirectTarget,
-      redirectTargetIsDir: redirectTargetIsDir, unixOwner: o,
-      hashType: hashType, blake2Digest: blake2Digest);
+      cryptInfo: cryptInfo,
+      mtime: mtime,
+      ctime: ctime,
+      atime: atime,
+      redirectType: redirectType,
+      redirectTarget: redirectTarget,
+      redirectTargetIsDir: redirectTargetIsDir,
+      unixOwner: o,
+      hashType: hashType,
+      blake2Digest: blake2Digest);
 
   _Extra50Result withHash(_HashResult h) => _Extra50Result(
-      cryptInfo: cryptInfo, mtime: mtime, ctime: ctime, atime: atime,
-      redirectType: redirectType, redirectTarget: redirectTarget,
-      redirectTargetIsDir: redirectTargetIsDir, unixOwner: unixOwner,
-      hashType: h.type, blake2Digest: h.digest);
+      cryptInfo: cryptInfo,
+      mtime: mtime,
+      ctime: ctime,
+      atime: atime,
+      redirectType: redirectType,
+      redirectTarget: redirectTarget,
+      redirectTargetIsDir: redirectTargetIsDir,
+      unixOwner: unixOwner,
+      hashType: h.type,
+      blake2Digest: h.digest);
 }
 
 /// Return value of [ArchiveReader._parseExtTime], carrying the three RAR 4.x

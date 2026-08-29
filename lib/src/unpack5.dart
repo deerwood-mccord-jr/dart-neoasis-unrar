@@ -5,6 +5,8 @@ library;
 import 'dart:typed_data';
 
 import 'bit_input.dart';
+import 'lz_copy.dart';
+import 'unpack_output.dart';
 import 'unrar_error.dart';
 
 /// Maximum LZ match length that can be encoded even for short distances.
@@ -126,26 +128,28 @@ class Rar5Unpacker {
   bool _extraDist = false;
 
   int _packedLength = 0;
-  final _output = BytesBuilder();
+  late UnpackOutput _output;
 
   /// Unpacks [packed] into a new byte buffer of [unpSize] bytes.
   ///
   /// [solid] marks a file continuing a solid stream; the window and match
   /// history of the previous file are reused. Returns the unpacked bytes.
-  Uint8List unpack5({
-    required Uint8List packed,
+  UnpackResult unpack5({
+    required PaddedInput packed,
+    required UnpackOutput output,
     required int unpSize,
     required int windowSize,
     required bool solid,
     required bool extraDist,
   }) {
     _extraDist = extraDist;
+    _output = output;
     _initWin(windowSize, solid);
-    _inp = BitInput.external(packed);
+    _inp = BitInput.padded(packed);
     _packedLength = packed.length;
     _destUnpSize = unpSize;
     _unpack5(solid);
-    return _output.takeBytes();
+    return _output.finish();
   }
 
   /// Mirrors `Unpack::Init`.
@@ -174,7 +178,8 @@ class Rar5Unpacker {
       _unpPtr = _wrPtr = 0;
       _prevPtr = 0;
       _firstWinDone = false;
-      _writeBorder = _maxWinSize < unpackMaxWrite ? _maxWinSize : unpackMaxWrite;
+      _writeBorder =
+          _maxWinSize < unpackMaxWrite ? _maxWinSize : unpackMaxWrite;
       _tablesRead5 = false;
     }
     _initFilters();
@@ -259,8 +264,10 @@ class Rar5Unpacker {
 
         // A block holding only a Huffman table leaves us on the block border
         // right after reading it, so the 'while' re-checks.
-        while (_inp.inAddr > _blockHeader.blockStart + _blockHeader.blockSize - 1 ||
-            (_inp.inAddr == _blockHeader.blockStart + _blockHeader.blockSize - 1 &&
+        while (_inp.inAddr >
+                _blockHeader.blockStart + _blockHeader.blockSize - 1 ||
+            (_inp.inAddr ==
+                    _blockHeader.blockStart + _blockHeader.blockSize - 1 &&
                 _inp.inBit >= _blockHeader.blockBitSize)) {
           if (_blockHeader.lastBlockInFile) {
             fileDone = true;
@@ -397,37 +404,15 @@ class Rar5Unpacker {
 
   /// Mirrors `Unpack::CopyString`.
   void _copyString(int length, int distance) {
-    final window = _window!;
-    var srcPtr = _unpPtr - distance;
-
-    if (distance > _unpPtr) {
-      srcPtr += _maxWinSize;
-
-      if (distance > _maxWinSize || !_firstWinDone) {
-        // Fill the area with zeroes, so the output does not depend on
-        // previously extracted data and offsets stay valid.
-        while (length-- > 0) {
-          window[_unpPtr] = 0;
-          _unpPtr = _wrapUp(_unpPtr + 1);
-        }
-        return;
-      }
-    }
-
-    if (srcPtr < _maxWinSize - maxIncLzMatch &&
-        _unpPtr < _maxWinSize - maxIncLzMatch) {
-      // Fast path: far enough from the window ends to skip wrap checks.
-      final start = _unpPtr;
-      for (var i = 0; i < length; i++) {
-        window[start + i] = window[srcPtr + i];
-      }
-      _unpPtr = start + length;
-    } else {
-      while (length-- > 0) {
-        window[_unpPtr] = window[_wrapUp(srcPtr++)];
-        _unpPtr = _wrapUp(_unpPtr + 1);
-      }
-    }
+    _unpPtr = copyLzMatch(
+      window: _window!,
+      destination: _unpPtr,
+      length: length,
+      distance: distance,
+      windowSize: _maxWinSize,
+      firstWindowDone: _firstWinDone,
+      endMargin: maxIncLzMatch,
+    );
   }
 
   /// Mirrors `Unpack::ReadBlockHeader`.
@@ -549,8 +534,8 @@ class Rar5Unpacker {
     makeDecodeTables(table.sublist(nc, nc + dCodes), tables.dd, dCodes);
     makeDecodeTables(
         table.sublist(nc + dCodes, nc + dCodes + ldc), tables.ldd, ldc);
-    makeDecodeTables(
-        table.sublist(nc + dCodes + ldc, nc + dCodes + ldc + rc), tables.rd, rc);
+    makeDecodeTables(table.sublist(nc + dCodes + ldc, nc + dCodes + ldc + rc),
+        tables.rd, rc);
     return true;
   }
 
@@ -597,8 +582,8 @@ class Rar5Unpacker {
 
     // A filter whose start lies in not-yet-written circular-dictionary data
     // is deferred to the next window block.
-    filter.nextWindow = _wrPtr != _unpPtr &&
-        _wrapDown(_wrPtr - _unpPtr) <= filter.blockStart;
+    filter.nextWindow =
+        _wrPtr != _unpPtr && _wrapDown(_wrPtr - _unpPtr) <= filter.blockStart;
 
     filter.blockStart = (filter.blockStart + _unpPtr) % _maxWinSize;
     _filters.add(filter);
@@ -645,7 +630,8 @@ class Rar5Unpacker {
             } else {
               final firstPartLength = _maxWinSize - blockStart;
               mem.setRange(0, firstPartLength, _window!, blockStart);
-              mem.setRange(firstPartLength, blockEnd + firstPartLength, _window!, 0);
+              mem.setRange(
+                  firstPartLength, blockEnd + firstPartLength, _window!, 0);
             }
 
             final outMem = _applyFilter(mem, blockLength, flt);
@@ -696,8 +682,8 @@ class Rar5Unpacker {
       _wrPtr = _unpPtr;
     }
 
-    _writeBorder = _wrapUp(
-        _unpPtr + (_maxWinSize < unpackMaxWrite ? _maxWinSize : unpackMaxWrite));
+    _writeBorder = _wrapUp(_unpPtr +
+        (_maxWinSize < unpackMaxWrite ? _maxWinSize : unpackMaxWrite));
 
     if (_writeBorder == _unpPtr ||
         (_wrPtr != _unpPtr &&
@@ -764,7 +750,9 @@ class Rar5Unpacker {
         var srcPos = 0;
         for (var curChannel = 0; curChannel < channels; curChannel++) {
           var prevByte = 0;
-          for (var destPos = curChannel; destPos < dataSize; destPos += channels) {
+          for (var destPos = curChannel;
+              destPos < dataSize;
+              destPos += channels) {
             prevByte = (prevByte - data[srcPos++]) & 0xff;
             dst[destPos] = prevByte;
           }
@@ -782,8 +770,8 @@ class Rar5Unpacker {
           _maxWinSize - startPtr);
       _unpWriteData(Uint8List.sublistView(window, 0, endPtr), endPtr);
     } else {
-      _unpWriteData(Uint8List.sublistView(window, startPtr, endPtr),
-          endPtr - startPtr);
+      _unpWriteData(
+          Uint8List.sublistView(window, startPtr, endPtr), endPtr - startPtr);
     }
   }
 
@@ -798,7 +786,7 @@ class Rar5Unpacker {
       writeSize = leftToWrite;
     }
     if (writeSize > 0) {
-      _output.add(data.sublist(0, writeSize));
+      _output.add(data, 0, writeSize);
     }
     _writtenFileSize += size;
   }
