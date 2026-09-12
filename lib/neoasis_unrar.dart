@@ -13,6 +13,7 @@ export 'src/archive_entry.dart';
 export 'src/archive_info.dart';
 export 'src/byte_source.dart';
 export 'src/header_constants.dart';
+export 'src/archive_reader_sync.dart' show SyncArchiveReader;
 export 'src/recvol.dart'
     show
         RevHeader,
@@ -34,6 +35,7 @@ export 'src/volume.dart'
 import 'src/archive_entry.dart';
 import 'src/archive_info.dart';
 import 'src/archive_reader.dart';
+import 'src/archive_reader_sync.dart';
 import 'src/byte_source.dart';
 import 'src/header_constants.dart';
 import 'src/volume.dart';
@@ -108,4 +110,52 @@ class RarArchive {
 
   /// Releases the underlying source.
   Future<void> close() => _reader.close();
+}
+
+/// Synchronous twin of [RarArchive] for in-memory archives only — no
+/// `Future` anywhere in its surface, so it can be driven from ordinary
+/// (non-`async`) code that genuinely cannot `await` (a synchronous
+/// drag-and-drop virtual-file provider callback, for instance).
+///
+/// Backed by [SyncArchiveReader]/[MemorySyncByteSource]: reading already-
+/// in-memory bytes has no real I/O to wait on, so this costs nothing over
+/// the async [RarArchive] for that one case, and gains a call graph that
+/// never needs an event-loop turn. See [SyncByteSource]'s doc comment for
+/// why there is no disk-backed synchronous source, and
+/// [SyncArchiveReader]'s for why multi-volume archives are out of scope
+/// here (split entries throw instead of resolving further volumes).
+class SyncRarArchive {
+  SyncRarArchive._(this._reader);
+
+  final SyncArchiveReader _reader;
+
+  /// Opens [bytes] as a complete, self-contained RAR archive already held
+  /// in memory and detects its format/main header. See [RarArchive.open]
+  /// for the [password] contract this mirrors (multi-volume params aside —
+  /// this class has none).
+  factory SyncRarArchive.openBytes(Uint8List bytes, {String? password}) {
+    final reader =
+        SyncArchiveReader(MemorySyncByteSource(bytes), password: password);
+    reader.init();
+    return SyncRarArchive._(reader);
+  }
+
+  /// Detected archive format (RAR 4.x or RAR 5.0).
+  RarFormat get format => _reader.format;
+
+  /// `true` if any header checksum mismatch was detected while reading.
+  bool get isBroken => _reader.isBroken;
+
+  /// Lists all file entries in the archive.
+  List<ArchiveEntry> list() => _reader.list();
+
+  /// Extracts the first file entry named [name], returning its unpacked
+  /// bytes, or `null` if no such file exists. Throws [UnrarException] if
+  /// the entry spans multiple volumes (see [SyncArchiveReader]'s doc
+  /// comment — this class only ever opens one, complete, in-memory
+  /// archive).
+  Uint8List? extractFile(String name) => _reader.extractFile(name);
+
+  /// Releases the underlying source.
+  void close() => _reader.close();
 }
