@@ -1,0 +1,1439 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'aes.dart';
+import 'archive_entry.dart';
+import 'archive_info.dart';
+import 'blake2s.dart';
+import 'byte_source.dart';
+import 'crc.dart';
+import 'enc_name.dart';
+import 'header_constants.dart';
+import 'kdf3.dart';
+import 'kdf5.dart';
+import 'rar_time.dart';
+import 'raw_reader_sync.dart';
+import 'sha256.dart';
+import 'unpacker_sync.dart';
+import 'unrar_error.dart';
+
+/// A single parsed block header — the same shape as [ArchiveReader]'s
+/// private `_BlockHeader`, redeclared here since Dart's `_`-privacy is
+/// per-file, not per-library.
+class _BlockHeader {
+  int headCrc = 0;
+  HeaderType type = HeaderType.headUnknown;
+  int flags = 0;
+  int headSize = 0;
+  int dataSize = 0;
+  int dataOffset = 0;
+  bool skipIfUnknown = false;
+  ArchiveEntry? entry;
+  bool isLastVolume = false;
+  bool hasRevSpace = false;
+}
+
+/// Synchronous twin of `ArchiveReader` (`archive_reader.dart`) — reads
+/// archive blocks from a [SyncByteSource] with no `Future` anywhere in its
+/// call graph, so it can be driven from ordinary (non-`async`) Dart code.
+/// See [SyncByteSource]'s doc comment for the motivating case.
+///
+/// **Deliberately does not support multi-volume archives** (no
+/// `archiveName`/`volumeResolver` constructor params, no split-entry
+/// extraction): every real caller of this sync path opens a complete,
+/// self-contained in-memory archive (a nested archive's own bytes,
+/// extracted from its container in one shot), never a multi-part `.r00`/
+/// `.r01`/... set — supporting that would mean synchronously resolving and
+/// opening additional volumes, which brings back exactly the I/O-may-block
+/// problem this class exists to avoid. [extractFile] throws
+/// [UnrarException] if the requested entry spans multiple volumes.
+///
+/// Otherwise mirrors `ArchiveReader` field-for-field and method-for-method;
+/// see that class's doc comments for the RARLAB C source this is ported
+/// from (`arcread.cpp`/`archive.cpp`).
+class SyncArchiveReader {
+  SyncArchiveReader(this._source, {String? password})
+      : _password = password,
+        _unpacker = SyncUnpacker(_source);
+
+  final SyncByteSource _source;
+  final String? _password;
+  final SyncUnpacker _unpacker;
+
+  RarFormat _format = RarFormat.rarFmtNone;
+  final ArchiveInfo _info = ArchiveInfo();
+  bool _encrypted = false;
+  bool _brokenHeader = false;
+  int _sfxSize = 0;
+  bool _initialized = false;
+
+  int _blockPos = 0;
+  int _nextBlockPos = 0;
+  int _firstBlockPos = 0;
+
+  List<int>? _rar5CryptSalt;
+  int _rar5CryptLg2 = 0;
+  List<int>? _rar5PswCheck;
+  bool _rar5UsePswCheck = false;
+  AesCbcDecryptor? _rar5HeaderDecryptor;
+
+  AesCbcDecryptor? _rar3HeaderDecryptor;
+
+  RarFormat get format => _format;
+  ArchiveInfo get info => _info;
+  bool get isBroken => _brokenHeader;
+  int get sfxSize => _sfxSize;
+  bool get isEncrypted => _encrypted;
+
+  /// Detects the format, reads the archive mark, and positions the source at
+  /// the first block after the main header.
+  void init() {
+    if (_initialized) {
+      return;
+    }
+    _init();
+    _initialized = true;
+  }
+
+  void _init() {
+    final first = _readExact(7);
+    if (first.length < 7) {
+      throw const UnrarFormatException('Not a RAR archive');
+    }
+
+    var format = _isSignature(first, 0, 7);
+    var sfxPos = 0;
+
+    if (format == RarFormat.rarFmtNone) {
+      final rest = _source.read(maxSfxSize);
+      final found = _findSignature(rest);
+      if (found < 0) {
+        throw const UnrarFormatException('Not a RAR archive');
+      }
+      format = _isSignature(rest, found, rest.length - found);
+      sfxPos = found + 7;
+      _source.seek(sfxPos);
+      _readExact(7);
+    }
+
+    if (format == RarFormat.rarFmtFuture) {
+      throw const UnrarFormatException(
+          'Archive uses an unknown future RAR format');
+    }
+    if (format == RarFormat.rarFmt14) {
+      _format = format;
+      _sfxSize = sfxPos;
+      _source.seek(sfxPos + 4);
+      final mainFound2 = _readHeader14Main();
+      if (!mainFound2) {
+        throw const UnrarFormatException('RAR 1.4 main header is missing');
+      }
+      _firstBlockPos = _nextBlockPos;
+      return;
+    }
+    if (format == RarFormat.rarFmtNone) {
+      throw const UnrarFormatException('Not a RAR archive');
+    }
+
+    _format = format;
+    _sfxSize = sfxPos;
+
+    if (_format == RarFormat.rarFmt50) {
+      final extra = _readExact(1);
+      if (extra.length != 1 || extra[0] != 0) {
+        throw const UnrarFormatException('Corrupt RAR 5.0 signature');
+      }
+    }
+
+    var mainFound = false;
+    while (true) {
+      final head = _readHeader();
+      if (head == null) {
+        break;
+      }
+      _seekToNext();
+      if (head.type == HeaderType.headMain) {
+        mainFound = true;
+        break;
+      }
+    }
+
+    if (_encrypted) {
+      if (_password == null) {
+        throw const UnrarException(
+            'Archive headers are encrypted: supply a password');
+      }
+    }
+
+    if (!mainFound) {
+      throw const UnrarFormatException('Main archive header is missing');
+    }
+
+    if (_brokenHeader) {
+      throw const UnrarHeaderException('Main archive header is corrupt');
+    }
+
+    _firstBlockPos = _nextBlockPos;
+    _seekToNext();
+  }
+
+  /// Repositions the reader to the first block after the main header.
+  void _rewind() {
+    _blockPos = _firstBlockPos;
+    _source.seek(_firstBlockPos);
+  }
+
+  /// Returns the list of file entries (skipping service blocks), positioned
+  /// after the main header.
+  List<ArchiveEntry> list() {
+    if (!_initialized) {
+      init();
+    }
+    final entries = <ArchiveEntry>[];
+    while (true) {
+      final head = _readHeader();
+      if (head == null) {
+        break;
+      }
+      if (head.type == HeaderType.headEndArc) {
+        break;
+      }
+      if (head.type == HeaderType.headFile && head.entry != null) {
+        entries.add(head.entry!);
+      }
+      _seekToNext();
+    }
+    return entries;
+  }
+
+  void close() {
+    _unpacker.clearSensitiveState();
+    _rar3HeaderDecryptor = null;
+    _rar5HeaderDecryptor = null;
+    _source.close();
+  }
+
+  /// Extracts the first file entry named [name], or `null` if not present.
+  /// See `ArchiveReader.extractFile` for the full contract this mirrors —
+  /// the one difference being a split (multi-volume) entry throws instead
+  /// of resolving further volumes (see this class's own doc comment).
+  Uint8List? extractFile(String name) {
+    if (!_initialized) {
+      init();
+    } else {
+      _rewind();
+    }
+    while (true) {
+      final head = _readHeader();
+      if (head == null || head.type == HeaderType.headEndArc) {
+        return null;
+      }
+      final entry = head.entry;
+      if (entry != null && !entry.isDirectory) {
+        if (entry.name == name) {
+          return _unpackEntry(entry, head);
+        }
+        if (_info.solid && entry.method != 0) {
+          _unpackEntry(entry, head);
+        }
+      }
+      _seekToNext();
+    }
+  }
+
+  Uint8List _unpackEntry(ArchiveEntry entry, _BlockHeader head,
+      {bool collectOutput = true}) {
+    if (entry.redirectType == FileSystemRedirect.fsRedirFileCopy ||
+        entry.redirectType == FileSystemRedirect.fsRedirHardLink) {
+      final sourceName = entry.redirectTarget;
+      if (sourceName == null || sourceName.isEmpty) {
+        throw UnrarException(
+            'Redirect entry "${entry.name}" has no redirect target');
+      }
+      final source = extractFile(sourceName);
+      if (source == null) {
+        throw UnrarException(
+            'Redirect entry "${entry.name}" points to missing source '
+            '"$sourceName" (ERAR_EREFERENCE)');
+      }
+      return source;
+    }
+
+    if (entry.isEncrypted) {
+      if (_password == null) {
+        throw const UnrarException(
+            'File is encrypted: supply a password to extract it');
+      }
+      if (entry.cryptInfo == null) {
+        throw const UnrarException(
+            'File is marked encrypted but has no crypto parameters');
+      }
+    }
+    if (entry.splitBefore) {
+      throw const UnrarException(
+          'Entry starts in a preceding volume; open the first part');
+    }
+    if (entry.splitAfter) {
+      throw const UnrarException(
+          'Entry spans multiple volumes: multi-volume archives are not '
+          'supported by the synchronous reader — open this archive via '
+          'the async RarArchive API instead');
+    }
+    final isRar14 = entry.unpVer == 10 || entry.unpVer == 13;
+    final crcForUnpacker = isRar14 ? 0 : entry.crc32;
+
+    final out = _unpacker.unpack(
+      method: entry.method,
+      packSize: head.dataSize,
+      unpSize: entry.unpSize,
+      unknownUnpSize: entry.unknownUnpSize,
+      dataOffset: head.dataOffset,
+      expectedCrc: crcForUnpacker,
+      unpVer: entry.unpVer,
+      windowSize: entry.windowSize,
+      solid: entry.isSolid,
+      password: _password,
+      cryptInfo: entry.cryptInfo,
+      hashType: entry.hashType,
+      blake2Digest: entry.blake2Digest,
+      collectOutput: collectOutput || isRar14,
+    );
+
+    if (isRar14 && entry.crc32 != 0) {
+      final actual = checksum14(0, out);
+      if (actual != entry.crc32) {
+        throw UnrarException(
+            'Checksum14 mismatch for RAR 1.4 entry "${entry.name}" '
+            '(expected 0x${entry.crc32.toRadixString(16)}, '
+            'got 0x${actual.toRadixString(16)})');
+      }
+    }
+    return out;
+  }
+
+  Uint8List _readExact(int size) {
+    final buffer = Uint8List(size);
+    var written = 0;
+    while (written < size) {
+      final chunk = _source.read(size - written);
+      if (chunk.isEmpty) {
+        break;
+      }
+      final copyLength =
+          chunk.length > size - written ? size - written : chunk.length;
+      buffer.setRange(written, written + copyLength, chunk);
+      written += copyLength;
+    }
+    return written == size ? buffer : Uint8List.sublistView(buffer, 0, written);
+  }
+
+  void _seekToNext() => _source.seek(_nextBlockPos);
+
+  _BlockHeader? _readHeader() {
+    _blockPos = _source.position();
+    switch (_format) {
+      case RarFormat.rarFmt14:
+        return _readHeader14();
+      case RarFormat.rarFmt15:
+        return _readHeader15();
+      case RarFormat.rarFmt50:
+        return _readHeader50();
+      default:
+        return null;
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // RAR 1.4 (rarFmt14) block reading.
+  // ---------------------------------------------------------------------
+
+  bool _readHeader14Main() {
+    final raw = _readExact(3);
+    if (raw.length < 3) return false;
+    final headSize = raw[0] | (raw[1] << 8);
+    if (headSize < 7) return false;
+    final flags = raw[2];
+    _info.volume = (flags & mhdVolume) != 0;
+    _info.solid = (flags & mhdSolid) != 0;
+    _info.locked = (flags & mhdLock) != 0;
+    _info.encrypted = (flags & mhdPassword) != 0;
+    _info.newNumbering = false;
+    final toSkip = headSize - 7;
+    if (toSkip > 0) {
+      _readExact(toSkip);
+    }
+    _nextBlockPos = _sfxSize + headSize;
+    _source.seek(_nextBlockPos);
+    return true;
+  }
+
+  _BlockHeader? _readHeader14() {
+    const minSize = 21;
+    final raw = _readExact(minSize);
+    if (raw.length < minSize) return null;
+
+    final dataSize = raw[0] | (raw[1] << 8) | (raw[2] << 16) | (raw[3] << 24);
+    final unpSize = raw[4] | (raw[5] << 8) | (raw[6] << 16) | (raw[7] << 24);
+    final checksum = raw[8] | (raw[9] << 8);
+    final headSize = raw[10] | (raw[11] << 8);
+    if (headSize < minSize) return null;
+    final fileTime =
+        raw[12] | (raw[13] << 8) | (raw[14] << 16) | (raw[15] << 24);
+    final fileAttr = raw[16];
+    final flags14 = raw[17];
+    final unpVerByte = raw[18];
+    final nameSize = raw[19];
+    final method = raw[20] - 0x30;
+    final nameBytes = _readExact(nameSize);
+    final name = String.fromCharCodes(nameBytes);
+
+    final headerBodyRead = minSize + nameSize;
+    if (headSize > headerBodyRead) {
+      _readExact(headSize - headerBodyRead);
+    }
+
+    _nextBlockPos = _blockPos + headSize + dataSize;
+    final head = _BlockHeader()
+      ..type = HeaderType.headFile
+      ..headSize = headSize
+      ..dataSize = dataSize
+      ..dataOffset = _blockPos + headSize
+      ..flags = flags14 | longBlock;
+
+    final unpVer = (unpVerByte == 2) ? 13 : 10;
+    final isDir = (fileAttr & 0x10) != 0;
+
+    head.entry = ArchiveEntry(
+      name: name,
+      packSize: dataSize,
+      unpSize: unpSize,
+      isDirectory: isDir,
+      isEncrypted: (flags14 & lhdPassword) != 0,
+      isSolid: false,
+      splitBefore: (flags14 & lhdSplitBefore) != 0,
+      splitAfter: (flags14 & lhdSplitAfter) != 0,
+      crc32: checksum,
+      modifiedTime: dosTimeToDateTime(fileTime),
+      method: method,
+      unpVer: unpVer,
+      hostOs: hostMsDos,
+      fileAttr: fileAttr,
+      flags: flags14 | longBlock,
+      windowSize: 0x10000,
+      unknownUnpSize: unpSize == 0xffffffff,
+      isService: false,
+      hostSystemType: HostSystemType.hsysWindows,
+    );
+    return head;
+  }
+  // ---------------------------------------------------------------------
+
+  _BlockHeader? _readHeader15() {
+    final needsDecrypt = _encrypted && _blockPos > _sfxSize + sizofMarkHead3;
+
+    if (needsDecrypt && _rar3HeaderDecryptor == null) {
+      if (_password == null) {
+        throw const UnrarException(
+            'Archive headers are encrypted: supply a password');
+      }
+      final salt = _readExact(sizeSalt30);
+      if (salt.length != sizeSalt30) {
+        return null;
+      }
+      final kdf = kdf3(_password, salt);
+      _rar3HeaderDecryptor =
+          AesCbcDecryptor(Aes.withKey(Uint8List.fromList(kdf.key)), kdf.init);
+    }
+
+    final raw = SyncRawReader(_source,
+        decryptor: needsDecrypt ? _rar3HeaderDecryptor : null);
+    if (raw.read(sizofShortBlockHead) == 0) {
+      return null;
+    }
+
+    final head = _BlockHeader();
+    head.headCrc = raw.get2();
+    final rawType = raw.get1();
+    head.flags = raw.get2();
+    head.skipIfUnknown = (head.flags & skipIfUnknown) != 0;
+    head.headSize = raw.get2();
+
+    head.type = _mapHeaderType15(rawType);
+    if (head.headSize < sizofShortBlockHead) {
+      _brokenHeader = true;
+      return null;
+    }
+
+    if (head.type == HeaderType.head3Cmt) {
+      final fixed = sizofCommHead - sizofShortBlockHead;
+      final extra = head.headSize - sizofShortBlockHead;
+      raw.read(fixed < extra ? fixed : extra);
+    } else if (head.type == HeaderType.headMain &&
+        (head.flags & mhdComment) != 0) {
+      final fixed = sizofMainHead3 - sizofShortBlockHead;
+      final extra = head.headSize - sizofShortBlockHead;
+      raw.read(fixed < extra ? fixed : extra);
+    } else {
+      raw.read(head.headSize - sizofShortBlockHead);
+    }
+
+    _nextBlockPos = _blockPos + head.headSize;
+    head.dataOffset = _nextBlockPos;
+
+    switch (head.type) {
+      case HeaderType.headMain:
+        _info.reset();
+        _info.highPosAv = raw.get2();
+        _info.posAv = raw.get4();
+        _info.volume = (head.flags & mhdVolume) != 0;
+        _info.solid = (head.flags & mhdSolid) != 0;
+        _info.locked = (head.flags & mhdLock) != 0;
+        _info.protected = (head.flags & mhdProtect) != 0;
+        _info.encrypted = (head.flags & mhdPassword) != 0;
+        _info.firstVolume = (head.flags & mhdFirstVolume) != 0;
+        _info.newNumbering = (head.flags & mhdNewNumbering) != 0;
+        _info.comment = (head.flags & mhdComment) != 0;
+        _info.signed = _info.posAv != 0 || _info.highPosAv != 0;
+        _encrypted = _info.encrypted;
+        break;
+      case HeaderType.headFile:
+      case HeaderType.headService:
+        head.entry = _parseFileHeader15(
+          raw,
+          head,
+          isService: head.type == HeaderType.headService,
+        );
+        _nextBlockPos = (_nextBlockPos + head.dataSize) & 0xFFFFFFFFFFFFFFFF;
+        final e = head.entry;
+        if (e != null &&
+            e.redirectType == FileSystemRedirect.fsRedirUnixSymlink &&
+            e.redirectTarget == null &&
+            e.method == 0 &&
+            head.dataSize > 0 &&
+            head.dataSize <= maxPathSize &&
+            !e.isEncrypted) {
+          final savedPos = _nextBlockPos;
+          _source.seek(head.dataOffset);
+          final targetBytes = _readExact(head.dataSize);
+          final end = targetBytes.indexOf(0);
+          final slice = end == -1 ? targetBytes : targetBytes.sublist(0, end);
+          final target = utf8.decode(slice, allowMalformed: true);
+          head.entry = ArchiveEntry(
+            name: e.name,
+            packSize: e.packSize,
+            unpSize: e.unpSize,
+            isDirectory: e.isDirectory,
+            isEncrypted: e.isEncrypted,
+            isSolid: e.isSolid,
+            splitBefore: e.splitBefore,
+            splitAfter: e.splitAfter,
+            crc32: e.crc32,
+            modifiedTime: e.modifiedTime,
+            createdTime: e.createdTime,
+            accessedTime: e.accessedTime,
+            method: e.method,
+            unpVer: e.unpVer,
+            hostOs: e.hostOs,
+            fileAttr: e.fileAttr,
+            flags: e.flags,
+            windowSize: e.windowSize,
+            unknownUnpSize: e.unknownUnpSize,
+            isService: e.isService,
+            hostSystemType: e.hostSystemType,
+            cryptInfo: e.cryptInfo,
+            redirectType: e.redirectType,
+            redirectTarget: target,
+            redirectTargetIsDir: e.redirectTargetIsDir,
+            unixOwner: e.unixOwner,
+            hashType: e.hashType,
+            blake2Digest: e.blake2Digest,
+          );
+          _nextBlockPos = savedPos;
+        }
+        break;
+      case HeaderType.headEndArc:
+        final earcNextVol = (head.flags & earcNextVolume) != 0;
+        final earcDataCrc = (head.flags & 0x0002) != 0;
+        if (earcDataCrc) raw.skip(4);
+        final earcRevSp = (head.flags & earcRevSpace) != 0;
+        if ((head.flags & earcVolNumber) != 0) {
+          raw.skip(2);
+        }
+        head.isLastVolume = !earcNextVol;
+        head.hasRevSpace = earcRevSp;
+        break;
+      case HeaderType.head3Protect:
+        head.dataSize = raw.get4();
+        _nextBlockPos = (_nextBlockPos + head.dataSize) & 0xFFFFFFFFFFFFFFFF;
+        break;
+      case HeaderType.head3Cmt:
+        raw.skip(2);
+        raw.skip(1);
+        raw.skip(1);
+        raw.skip(2);
+        _info.comment = true;
+        break;
+      case HeaderType.head3Av:
+      case HeaderType.head3Sign:
+        break;
+      case HeaderType.head3OldService:
+        final dataSize3 = raw.get4();
+        _nextBlockPos = (_nextBlockPos + dataSize3) & 0xFFFFFFFFFFFFFFFF;
+        break;
+      default:
+        if ((head.flags & longBlock) != 0) {
+          _nextBlockPos = (_nextBlockPos + raw.get4()) & 0xFFFFFFFFFFFFFFFF;
+        }
+    }
+
+    final commentInHeader = (head.type == HeaderType.headFile ||
+            head.type == HeaderType.headService) &&
+        (head.flags & lhdComment) != 0;
+    final headerCrc = raw.getCRC15(processedOnly: commentInHeader);
+    if (head.headCrc != headerCrc) {
+      final crcNotReliable =
+          head.type == HeaderType.head3Av || head.type == HeaderType.head3Sign;
+
+      bool recovered = false;
+      if (head.hasRevSpace) {
+        final len = _source.length();
+        if (len >= 7) {
+          _source.seek(len - 7);
+          final tail = _source.read(7);
+          recovered = tail.length == 7 && tail.every((b) => b == 0);
+        }
+      }
+      if (!crcNotReliable && !recovered) {
+        _brokenHeader = true;
+      }
+    }
+    return head;
+  }
+
+  ArchiveEntry? _parseFileHeader15(
+    SyncRawReader raw,
+    _BlockHeader head, {
+    required bool isService,
+  }) {
+    final dataSize = raw.get4();
+    final lowUnpSize = raw.get4();
+    final hostOs = raw.get1();
+    final fileCrc = raw.get4();
+    final fileTime = raw.get4();
+    final unpVer = raw.get1();
+    final method = raw.get1() - 0x30;
+    final nameSize = raw.get2();
+    final fileAttr = raw.get4();
+
+    final largeFile = (head.flags & lhdLarge) != 0;
+    var highPackSize = 0;
+    var highUnpSize = 0;
+    var unknownUnpSize = false;
+    if (largeFile) {
+      highPackSize = raw.get4();
+      highUnpSize = raw.get4();
+      unknownUnpSize = lowUnpSize == 0xffffffff && highUnpSize == 0xffffffff;
+    } else {
+      unknownUnpSize = lowUnpSize == 0xffffffff;
+    }
+    final packSize = ((highPackSize << 32) | dataSize) & 0xFFFFFFFFFFFFFFFF;
+    var unpSize = ((highUnpSize << 32) | lowUnpSize) & 0xFFFFFFFFFFFFFFFF;
+    if (unknownUnpSize) {
+      unpSize = int64Ndf;
+    }
+    head.dataSize = packSize;
+
+    final readNameSize = nameSize < maxPathSize ? nameSize : maxPathSize;
+    final rawName = raw.getB(readNameSize);
+    final name = _decodeName15(rawName, head.flags);
+
+    if (isService) {
+      if (name.toUpperCase() == 'CMT') {
+        _info.comment = true;
+      }
+      if ((head.flags & lhdSalt) != 0) {
+        raw.skip(sizeSalt30);
+      }
+      return null;
+    }
+
+    CryptInfo? cryptInfo;
+    if ((head.flags & lhdSalt) != 0) {
+      final salt = raw.getB(sizeSalt30);
+      cryptInfo = CryptInfo(isRar4: true, salt: salt);
+    }
+
+    var modifiedTime = dosTimeToDateTime(fileTime);
+    DateTime? createdTime15;
+    DateTime? accessedTime15;
+    if ((head.flags & lhdExtTime) != 0) {
+      final ext = _parseExtTime(raw, fileTime, modifiedTime);
+      modifiedTime = ext.mtime;
+      createdTime15 = ext.ctime;
+      accessedTime15 = ext.atime;
+    }
+
+    final isDir = (head.flags & lhdWindowMask) == lhdDirectory;
+    final windowSize =
+        isDir ? 0 : 0x10000 << ((head.flags & lhdWindowMask) >> 5);
+
+    final isUnixHost = hostOs == hostUnix || hostOs == hostBeos;
+    final isUnixSymlink =
+        isUnixHost && (fileAttr & 0xf000) == 0xa000 /* S_IFLNK */;
+    final redirectType = isUnixSymlink
+        ? FileSystemRedirect.fsRedirUnixSymlink
+        : FileSystemRedirect.fsRedirNone;
+
+    return ArchiveEntry(
+      name: name,
+      packSize: packSize,
+      unpSize: unpSize,
+      isDirectory: isDir,
+      isEncrypted: (head.flags & lhdPassword) != 0,
+      isSolid: (head.flags & lhdSolid) != 0,
+      splitBefore: (head.flags & lhdSplitBefore) != 0,
+      splitAfter: (head.flags & lhdSplitAfter) != 0,
+      crc32: fileCrc,
+      modifiedTime: modifiedTime,
+      createdTime: createdTime15,
+      accessedTime: accessedTime15,
+      method: method,
+      unpVer: unpVer,
+      hostOs: hostOs,
+      fileAttr: fileAttr,
+      flags: head.flags,
+      windowSize: windowSize,
+      unknownUnpSize: unknownUnpSize,
+      isService: false,
+      hostSystemType: isUnixHost
+          ? HostSystemType.hsysUnix
+          : hostOs < hostMax
+              ? HostSystemType.hsysWindows
+              : HostSystemType.hsysUnknown,
+      cryptInfo: cryptInfo,
+      redirectType: redirectType,
+    );
+  }
+
+  String _decodeName15(List<int> rawName, int flags) {
+    if ((flags & lhdUnicode) != 0) {
+      var length = 0;
+      while (length < rawName.length && rawName[length] != 0) {
+        length++;
+      }
+      length++;
+      if (length < rawName.length) {
+        return decodeEncodedName(rawName, rawName.sublist(length));
+      }
+    }
+    final end = rawName.indexOf(0);
+    final slice = end == -1 ? rawName : rawName.sublist(0, end);
+    return String.fromCharCodes(slice);
+  }
+
+  _ExtTime15 _parseExtTime(SyncRawReader raw, int fileTime, DateTime base) {
+    final extFlags = raw.get2();
+    var mtime = base;
+    DateTime? ctime;
+    DateTime? atime;
+    for (var i = 0; i < 4; i++) {
+      final rmode = (extFlags >> ((3 - i) * 4)) & 0xf;
+      if ((rmode & 8) == 0 || i == 3) {
+        continue;
+      }
+      final dosTime = i == 0 ? fileTime : raw.get4();
+      var dt = dosTimeToDateTime(dosTime);
+      if ((rmode & 4) != 0) {
+        dt = dt.add(const Duration(seconds: 1));
+      }
+      var reminder = 0;
+      final count = rmode & 3;
+      for (var j = 0; j < count; j++) {
+        final curByte = raw.get1();
+        reminder |= curByte << ((j + 3 - count) * 8);
+      }
+      final us = (reminder * 100) ~/ 1000;
+      final precise = dt.add(Duration(microseconds: us));
+      if (i == 0) {
+        mtime = precise;
+      } else if (i == 1) {
+        ctime = precise;
+      } else if (i == 2) {
+        atime = precise;
+      }
+    }
+    return _ExtTime15(mtime: mtime, ctime: ctime, atime: atime);
+  }
+
+  // ---------------------------------------------------------------------
+  // RAR 5.0 block reading.
+  // ---------------------------------------------------------------------
+
+  _BlockHeader? _readHeader50() {
+    AesCbcDecryptor? decryptor;
+    if (_encrypted && _blockPos > _sfxSize + sizofMarkHead5) {
+      if (_password == null) {
+        throw const UnrarException(
+            'Archive headers are encrypted: supply a password');
+      }
+      final ivBytes = _readExact(sizeInitV);
+      if (ivBytes.length != sizeInitV) {
+        return null;
+      }
+      if (_rar5HeaderDecryptor == null) {
+        throw const UnrarException(
+            'HEAD_CRYPT block not found before encrypted header');
+      }
+      decryptor = AesCbcDecryptor(_rar5HeaderDecryptor!.aes, ivBytes);
+    }
+
+    final raw = SyncRawReader(_source, decryptor: decryptor);
+    if (raw.read(sizofShortBlockHead5) < sizofShortBlockHead5) {
+      return null;
+    }
+
+    final head = _BlockHeader();
+    head.headCrc = raw.get4();
+    final sizeBytes = raw.getVSize(4);
+    final blockSize = raw.getV();
+
+    if (blockSize == 0 || sizeBytes == 0) {
+      _brokenHeader = true;
+      return null;
+    }
+
+    final sizeToRead = blockSize - (sizofShortBlockHead5 - sizeBytes - 4);
+    final headerSize = 4 + sizeBytes + blockSize;
+
+    if (sizeToRead < 0 || headerSize < sizofShortBlockHead5) {
+      _brokenHeader = true;
+      return null;
+    }
+
+    if (raw.size < headerSize) {
+      raw.read(sizeToRead);
+    }
+    if (raw.size < headerSize) {
+      return null;
+    }
+
+    final headerCrc = raw.getCRC50(upTo: headerSize);
+
+    head.type = _mapHeaderType50(raw.getV());
+    head.flags = raw.getV();
+    head.skipIfUnknown = (head.flags & hflSkipIfUnknown) != 0;
+    head.headSize = headerSize;
+
+    if (head.headCrc != headerCrc) {
+      _brokenHeader = true;
+    }
+
+    var extraSize = 0;
+    if ((head.flags & hflExtra) != 0) {
+      extraSize = raw.getV();
+      if (extraSize >= head.headSize) {
+        _brokenHeader = true;
+        return null;
+      }
+    }
+
+    var dataSize = 0;
+    if ((head.flags & hflData) != 0) {
+      dataSize = raw.getV();
+    }
+
+    _nextBlockPos = (_blockPos + head.headSize) & 0xFFFFFFFFFFFFFFFF;
+    _nextBlockPos = (_nextBlockPos + dataSize) & 0xFFFFFFFFFFFFFFFF;
+    head.dataOffset = _blockPos + head.headSize;
+
+    if (decryptor != null) {
+      final alignedHead = (head.headSize + 15) & ~15;
+      _nextBlockPos = _blockPos + sizeInitV + alignedHead + dataSize;
+      head.dataOffset = _blockPos + sizeInitV + alignedHead;
+    }
+
+    switch (head.type) {
+      case HeaderType.headCrypt:
+        _encrypted = true;
+        _info.encrypted = true;
+        _parseCryptHead50(raw);
+        break;
+      case HeaderType.headMain:
+        _parseMainHeader50(raw);
+        if (extraSize != 0) {
+          raw.skip(extraSize);
+        }
+        break;
+      case HeaderType.headFile:
+      case HeaderType.headService:
+        head.dataSize = dataSize;
+        head.entry = _parseFileHeader50(
+          raw,
+          head,
+          extraSize: extraSize,
+          isService: head.type == HeaderType.headService,
+        );
+        break;
+      case HeaderType.headEndArc:
+      default:
+        break;
+    }
+
+    return head;
+  }
+
+  void _parseCryptHead50(SyncRawReader raw) {
+    final cryptVersion = raw.getV();
+    if (cryptVersion > 0) {
+      return;
+    }
+    final encFlags = raw.getV();
+    _rar5UsePswCheck = (encFlags & chflCryptPswCheck) != 0;
+    _rar5CryptLg2 = raw.get1();
+    if (_rar5CryptLg2 > 24) {
+      return;
+    }
+    _rar5CryptSalt = raw.getB(sizeSalt50);
+    List<int>? pswCheckStored;
+    if (_rar5UsePswCheck) {
+      pswCheckStored = raw.getB(sizePswCheck);
+      final csum = raw.getB(4);
+      final digest = sha256(pswCheckStored);
+      if (digest[0] != csum[0] ||
+          digest[1] != csum[1] ||
+          digest[2] != csum[2] ||
+          digest[3] != csum[3]) {
+        _rar5UsePswCheck = false;
+      } else {
+        _rar5PswCheck = pswCheckStored;
+      }
+    }
+
+    if (_password != null && _rar5CryptSalt != null) {
+      final pwd = _password;
+      final kdf = kdf5(pwd, _rar5CryptSalt!, _rar5CryptLg2);
+      if (_rar5UsePswCheck && _rar5PswCheck != null) {
+        final pswCheck = _rar5PswCheck;
+        final computed = foldPswCheck(kdf.pswCheckValue);
+        for (var i = 0; i < sizePswCheck; i++) {
+          if (computed[i] != pswCheck![i]) {
+            throw const UnrarException(
+                'Wrong password for encrypted archive headers');
+          }
+        }
+      }
+      _rar5HeaderDecryptor = AesCbcDecryptor(
+          Aes.withKey(Uint8List.fromList(kdf.key)),
+          List<int>.filled(sizeInitV, 0));
+    }
+  }
+
+  void _parseMainHeader50(SyncRawReader raw) {
+    _info.reset();
+    final arcFlags = raw.getV();
+    _info.volume = (arcFlags & mhflVolume) != 0;
+    _info.solid = (arcFlags & mhflSolid) != 0;
+    _info.locked = (arcFlags & mhflLock) != 0;
+    _info.protected = (arcFlags & mhflProtect) != 0;
+    _info.signed = false;
+    _info.newNumbering = true;
+    if ((arcFlags & mhflVolNumber) != 0) {
+      _info.volNumber = raw.getV();
+    } else {
+      _info.volNumber = 0;
+    }
+    _info.firstVolume = _info.volume && _info.volNumber == 0;
+  }
+
+  ArchiveEntry? _parseFileHeader50(
+    SyncRawReader raw,
+    _BlockHeader head, {
+    required int extraSize,
+    required bool isService,
+  }) {
+    final fileFlags = raw.getV();
+    var unpSize = raw.getV();
+    final unknownUnpSize = (fileFlags & fhflUnpUnknown) != 0;
+    if (unknownUnpSize) {
+      unpSize = int64Ndf;
+    }
+    final fileAttr = raw.getV();
+
+    DateTime? modifiedTime;
+    if ((fileFlags & fhflUTime) != 0) {
+      modifiedTime = unixTimeToDateTime(raw.get4());
+    }
+
+    var fileCrc = 0;
+    if ((fileFlags & fhflCrc32) != 0) {
+      fileCrc = raw.get4();
+    }
+
+    final compInfo = raw.getV();
+    final method = (compInfo >> 7) & 7;
+    final unpVerRaw = compInfo & 0x3f;
+    var unpVer = verUnknown;
+    if (unpVerRaw == 0) {
+      unpVer = verPack5;
+    } else if (unpVerRaw == 1) {
+      unpVer = verPack7;
+    }
+
+    final hostOs = raw.getV();
+    final nameSize = raw.getV();
+
+    final readNameSize = nameSize < maxPathSize ? nameSize : maxPathSize;
+    final nameBytes = raw.getB(readNameSize);
+    final end = nameBytes.indexOf(0);
+    final slice = end == -1 ? nameBytes : nameBytes.sublist(0, end);
+    final name = utf8.decode(slice, allowMalformed: true);
+
+    if (isService) {
+      if (name.toUpperCase() == 'CMT') {
+        _info.comment = true;
+      }
+      return null;
+    }
+
+    final isDir = (fileFlags & fhflDirectory) != 0;
+    var windowSize = 0;
+    if (!isDir && unpVerRaw <= 1) {
+      windowSize =
+          0x20000 << ((compInfo >> 10) & (unpVerRaw == 0 ? 0x0f : 0x1f));
+    }
+
+    final extra50 =
+        extraSize != 0 ? _processExtra50(raw, extraSize, head.headSize) : null;
+    final cryptInfo = extra50?.cryptInfo;
+    final isEncrypted = cryptInfo != null;
+
+    return ArchiveEntry(
+      name: name,
+      packSize: head.dataSize,
+      unpSize: unpSize,
+      isDirectory: isDir,
+      isEncrypted: isEncrypted,
+      isSolid: (compInfo & fciSolid) != 0,
+      splitBefore: (head.flags & hflSplitBefore) != 0,
+      splitAfter: (head.flags & hflSplitAfter) != 0,
+      crc32: fileCrc,
+      modifiedTime: extra50?.mtime ?? modifiedTime,
+      createdTime: extra50?.ctime,
+      accessedTime: extra50?.atime,
+      method: method,
+      unpVer: unpVer,
+      hostOs: hostOs,
+      fileAttr: fileAttr,
+      flags: head.flags,
+      windowSize: windowSize,
+      unknownUnpSize: unknownUnpSize,
+      isService: false,
+      hostSystemType: hostOs == host5Unix
+          ? HostSystemType.hsysUnix
+          : hostOs == host5Windows
+              ? HostSystemType.hsysWindows
+              : HostSystemType.hsysUnknown,
+      cryptInfo: cryptInfo,
+      redirectType: extra50?.redirectType ?? FileSystemRedirect.fsRedirNone,
+      redirectTarget: extra50?.redirectTarget,
+      redirectTargetIsDir: extra50?.redirectTargetIsDir ?? false,
+      unixOwner: extra50?.unixOwner,
+      hashType: extra50?.hashType ?? FileHashType.none,
+      blake2Digest: extra50?.blake2Digest,
+    );
+  }
+
+  _Extra50Result? _processExtra50(
+      SyncRawReader raw, int extraSize, int headerSize) {
+    final extraStart = headerSize - extraSize;
+    if (extraStart < raw.readPos || extraStart < 0) {
+      return null;
+    }
+    raw.setPos(extraStart);
+    var result = const _Extra50Result();
+    while (raw.dataLeft >= 2) {
+      final fieldSize = raw.getV();
+      if (fieldSize <= 0 || raw.dataLeft == 0 || fieldSize > raw.dataLeft) {
+        break;
+      }
+      final nextPos = raw.readPos + fieldSize;
+      final fieldType = raw.getV();
+      if (nextPos - raw.readPos < 0) {
+        break;
+      }
+      switch (fieldType) {
+        case fhExtraCrypt:
+          final crypt = _parseFhExtraCrypt(raw, nextPos);
+          if (crypt != null) result = result.withCrypt(crypt);
+        case fhExtraHash:
+          final hash = _parseFhExtraHash(raw, nextPos);
+          if (hash != null) result = result.withHash(hash);
+        case fhExtraHtime:
+          final times = _parseFhExtraHtime(raw, fieldSize);
+          if (times != null) result = result.withTimes(times);
+        case fhExtraRedir:
+          final redir = _parseFhExtraRedir(raw, nextPos);
+          if (redir != null) result = result.withRedir(redir);
+        case fhExtraUowner:
+          final owner = _parseFhExtraUowner(raw, nextPos);
+          if (owner != null) result = result.withOwner(owner);
+        default:
+          break;
+      }
+      raw.setPos(nextPos);
+    }
+    return result;
+  }
+
+  CryptInfo? _parseFhExtraCrypt(SyncRawReader raw, int fieldEnd) {
+    final encVersion = raw.getV();
+    if (encVersion > 0) {
+      return null;
+    }
+    final flags = raw.getV();
+    final lg2 = raw.get1();
+    if (lg2 > 24) {
+      return null;
+    }
+    final salt = raw.getB(sizeSalt50);
+    final iv = raw.getB(sizeInitV);
+    final usePswCheck = (flags & chflCryptPswCheck) != 0;
+    final useHashKey = (flags & fhExtraCryptHashMac) != 0;
+    List<int>? pswCheck;
+    var validPswCheck = false;
+    if (usePswCheck && raw.readPos + sizePswCheck + 4 <= fieldEnd) {
+      final stored = raw.getB(sizePswCheck);
+      final csum = raw.getB(4);
+      final digest = sha256(stored);
+      if (digest[0] == csum[0] &&
+          digest[1] == csum[1] &&
+          digest[2] == csum[2] &&
+          digest[3] == csum[3]) {
+        pswCheck = stored;
+        validPswCheck = true;
+      }
+    }
+    return CryptInfo(
+      isRar4: false,
+      salt: salt,
+      iv: iv,
+      lg2Count: lg2,
+      pswCheck: pswCheck,
+      usePswCheck: validPswCheck,
+      useHashKey: useHashKey,
+    );
+  }
+
+  _HashResult? _parseFhExtraHash(SyncRawReader raw, int fieldEnd) {
+    final type = raw.getV();
+    switch (type) {
+      case fhExtraHashBlake2:
+        if (raw.readPos + blake2DigestSize > fieldEnd) {
+          return null;
+        }
+        return _HashResult(
+          type: FileHashType.blake2,
+          digest: raw.getB(blake2DigestSize),
+        );
+      default:
+        return null;
+    }
+  }
+
+  _TimesResult? _parseFhExtraHtime(SyncRawReader raw, int fieldSize) {
+    if (fieldSize < 1) return null;
+    final flags = raw.get1();
+    final isUnix = (flags & fhExtraHtimeUnixTime) != 0;
+    DateTime? mtime, ctime, atime;
+
+    if ((flags & fhExtraHtimeMtime) != 0) {
+      mtime = isUnix
+          ? unixTimeToDateTime(raw.get4())
+          : winFileTimeToDateTime(raw.get8());
+    }
+    if ((flags & fhExtraHtimeCtime) != 0) {
+      ctime = isUnix
+          ? unixTimeToDateTime(raw.get4())
+          : winFileTimeToDateTime(raw.get8());
+    }
+    if ((flags & fhExtraHtimeAtime) != 0) {
+      atime = isUnix
+          ? unixTimeToDateTime(raw.get4())
+          : winFileTimeToDateTime(raw.get8());
+    }
+    if (isUnix && (flags & fhExtraHtimeUnixNs) != 0) {
+      if (mtime != null) {
+        final ns = raw.get4() & 0x3fffffff;
+        if (ns < 1000000000) {
+          mtime = mtime.add(Duration(microseconds: ns ~/ 1000));
+        }
+      }
+      if (ctime != null) {
+        final ns = raw.get4() & 0x3fffffff;
+        if (ns < 1000000000) {
+          ctime = ctime.add(Duration(microseconds: ns ~/ 1000));
+        }
+      }
+      if (atime != null) {
+        final ns = raw.get4() & 0x3fffffff;
+        if (ns < 1000000000) {
+          atime = atime.add(Duration(microseconds: ns ~/ 1000));
+        }
+      }
+    }
+    return _TimesResult(mtime: mtime, ctime: ctime, atime: atime);
+  }
+
+  _RedirResult? _parseFhExtraRedir(SyncRawReader raw, int fieldEnd) {
+    final typeV = raw.getV();
+    if (typeV < 0 || typeV > FileSystemRedirect.values.length) return null;
+    final redirectType = FileSystemRedirect.values.firstWhere(
+        (e) => e.value == typeV,
+        orElse: () => FileSystemRedirect.fsRedirNone);
+    final flags = raw.getV();
+    final isDir = (flags & fhExtraRedirDir) != 0;
+    final nameSize = raw.getV();
+    if (nameSize <= 0 || nameSize > fieldEnd - raw.readPos) return null;
+    final nameBytes = raw.getB(nameSize);
+    final target = utf8.decode(nameBytes, allowMalformed: true);
+    return _RedirResult(type: redirectType, target: target, isDir: isDir);
+  }
+
+  UnixOwnerInfo? _parseFhExtraUowner(SyncRawReader raw, int fieldEnd) {
+    final flags = raw.getV();
+    String? ownerName, groupName;
+    int? ownerId, groupId;
+    if ((flags & fhExtraUownerUname) != 0) {
+      final len = raw.getV();
+      ownerName = String.fromCharCodes(raw.getB(len));
+    }
+    if ((flags & fhExtraUownerGname) != 0) {
+      final len = raw.getV();
+      groupName = String.fromCharCodes(raw.getB(len));
+    }
+    if ((flags & fhExtraUownerNumUid) != 0) {
+      ownerId = raw.getV();
+    }
+    if ((flags & fhExtraUownerNumGid) != 0) {
+      groupId = raw.getV();
+    }
+    if (ownerName == null &&
+        groupName == null &&
+        ownerId == null &&
+        groupId == null) {
+      return null;
+    }
+    return UnixOwnerInfo(
+      ownerName: ownerName,
+      groupName: groupName,
+      ownerId: ownerId,
+      groupId: groupId,
+    );
+  }
+
+  // ---------------------------------------------------------------------
+  // Signature and header type mapping.
+  // ---------------------------------------------------------------------
+  RarFormat _isSignature(List<int> d, int offset, int size) {
+    if (size >= 1 && d[offset] == 0x52) {
+      if (size >= 4 &&
+          d[offset + 1] == 0x45 &&
+          d[offset + 2] == 0x7e &&
+          d[offset + 3] == 0x5e) {
+        return RarFormat.rarFmt14;
+      }
+      if (size >= 7 &&
+          d[offset + 1] == 0x61 &&
+          d[offset + 2] == 0x72 &&
+          d[offset + 3] == 0x21 &&
+          d[offset + 4] == 0x1a &&
+          d[offset + 5] == 0x07) {
+        final b6 = d[offset + 6];
+        if (b6 == 0) {
+          return RarFormat.rarFmt15;
+        }
+        if (b6 == 1) {
+          return RarFormat.rarFmt50;
+        }
+        if (b6 > 1 && b6 < 5) {
+          return RarFormat.rarFmtFuture;
+        }
+      }
+    }
+    return RarFormat.rarFmtNone;
+  }
+
+  int _findSignature(List<int> data) {
+    for (var i = 0; i < data.length; i++) {
+      if (data[i] == 0x52 &&
+          _isSignature(data, i, data.length - i) != RarFormat.rarFmtNone) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  HeaderType _mapHeaderType15(int type) {
+    switch (type) {
+      case 0x73:
+        return HeaderType.headMain;
+      case 0x74:
+        return HeaderType.headFile;
+      case 0x75:
+        return HeaderType.head3Cmt;
+      case 0x76:
+        return HeaderType.head3Av;
+      case 0x77:
+        return HeaderType.head3OldService;
+      case 0x78:
+        return HeaderType.head3Protect;
+      case 0x79:
+        return HeaderType.head3Sign;
+      case 0x7a:
+        return HeaderType.headService;
+      case 0x7b:
+        return HeaderType.headEndArc;
+      default:
+        return HeaderType.headUnknown;
+    }
+  }
+
+  HeaderType _mapHeaderType50(int type) {
+    switch (type) {
+      case 0x00:
+        return HeaderType.headMark;
+      case 0x01:
+        return HeaderType.headMain;
+      case 0x02:
+        return HeaderType.headFile;
+      case 0x03:
+        return HeaderType.headService;
+      case 0x04:
+        return HeaderType.headCrypt;
+      case 0x05:
+        return HeaderType.headEndArc;
+      default:
+        return HeaderType.headUnknown;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Private result types for _processExtra50 — mirrors archive_reader.dart's.
+// ---------------------------------------------------------------------------
+
+class _TimesResult {
+  const _TimesResult({this.mtime, this.ctime, this.atime});
+  final DateTime? mtime;
+  final DateTime? ctime;
+  final DateTime? atime;
+}
+
+class _RedirResult {
+  const _RedirResult(
+      {required this.type, required this.target, required this.isDir});
+  final FileSystemRedirect type;
+  final String target;
+  final bool isDir;
+}
+
+class _HashResult {
+  const _HashResult({required this.type, required this.digest});
+  final FileHashType type;
+  final List<int> digest;
+}
+
+class _Extra50Result {
+  const _Extra50Result({
+    this.cryptInfo,
+    this.mtime,
+    this.ctime,
+    this.atime,
+    this.redirectType = FileSystemRedirect.fsRedirNone,
+    this.redirectTarget,
+    this.redirectTargetIsDir = false,
+    this.unixOwner,
+    this.hashType = FileHashType.none,
+    this.blake2Digest,
+  });
+
+  final CryptInfo? cryptInfo;
+  final DateTime? mtime;
+  final DateTime? ctime;
+  final DateTime? atime;
+  final FileSystemRedirect redirectType;
+  final String? redirectTarget;
+  final bool redirectTargetIsDir;
+  final UnixOwnerInfo? unixOwner;
+  final FileHashType hashType;
+  final List<int>? blake2Digest;
+
+  _Extra50Result withCrypt(CryptInfo c) => _Extra50Result(
+      cryptInfo: c,
+      mtime: mtime,
+      ctime: ctime,
+      atime: atime,
+      redirectType: redirectType,
+      redirectTarget: redirectTarget,
+      redirectTargetIsDir: redirectTargetIsDir,
+      unixOwner: unixOwner,
+      hashType: hashType,
+      blake2Digest: blake2Digest);
+
+  _Extra50Result withTimes(_TimesResult t) => _Extra50Result(
+      cryptInfo: cryptInfo,
+      mtime: t.mtime ?? mtime,
+      ctime: t.ctime ?? ctime,
+      atime: t.atime ?? atime,
+      redirectType: redirectType,
+      redirectTarget: redirectTarget,
+      redirectTargetIsDir: redirectTargetIsDir,
+      unixOwner: unixOwner,
+      hashType: hashType,
+      blake2Digest: blake2Digest);
+
+  _Extra50Result withRedir(_RedirResult r) => _Extra50Result(
+      cryptInfo: cryptInfo,
+      mtime: mtime,
+      ctime: ctime,
+      atime: atime,
+      redirectType: r.type,
+      redirectTarget: r.target,
+      redirectTargetIsDir: r.isDir,
+      unixOwner: unixOwner,
+      hashType: hashType,
+      blake2Digest: blake2Digest);
+
+  _Extra50Result withOwner(UnixOwnerInfo o) => _Extra50Result(
+      cryptInfo: cryptInfo,
+      mtime: mtime,
+      ctime: ctime,
+      atime: atime,
+      redirectType: redirectType,
+      redirectTarget: redirectTarget,
+      redirectTargetIsDir: redirectTargetIsDir,
+      unixOwner: o,
+      hashType: hashType,
+      blake2Digest: blake2Digest);
+
+  _Extra50Result withHash(_HashResult h) => _Extra50Result(
+      cryptInfo: cryptInfo,
+      mtime: mtime,
+      ctime: ctime,
+      atime: atime,
+      redirectType: redirectType,
+      redirectTarget: redirectTarget,
+      redirectTargetIsDir: redirectTargetIsDir,
+      unixOwner: unixOwner,
+      hashType: h.type,
+      blake2Digest: h.digest);
+}
+
+/// Return value of [SyncArchiveReader._parseExtTime], carrying the three
+/// RAR 4.x extended timestamps (modification, creation, last-access).
+class _ExtTime15 {
+  const _ExtTime15({required this.mtime, this.ctime, this.atime});
+  final DateTime mtime;
+  final DateTime? ctime;
+  final DateTime? atime;
+}
